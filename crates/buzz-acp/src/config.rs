@@ -6,10 +6,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use buzz_core::kind::{
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_REMINDER,
-    KIND_WORKFLOW_APPROVAL_REQUESTED,
-};
 use clap::Parser;
 use clap::ValueEnum;
 use nostr::Keys;
@@ -18,26 +14,6 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::filter::SubscriptionRule;
-
-/// Default idle timeout (seconds) when neither `--idle-timeout` nor the
-/// deprecated `--turn-timeout` is set.
-///
-/// Sized for slow turns where the agent may go silent on its outer ACP channel
-/// while running long sub-tools (e.g. a buzz-agent running another agent, or
-/// codex/claude doing multi-minute single tool calls). 1500s gives 300s of
-/// breathing room above the 1200s max shell timeout, so legitimate long-running
-/// tool calls don't race the idle deadline.
-/// Override via `--idle-timeout` / `BUZZ_ACP_IDLE_TIMEOUT`.
-pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1_500;
-
-/// Default absolute wall-clock cap per agent turn (2 hours).
-/// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
-pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
-
-/// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
-/// meaningless and risks arithmetic overflow when deriving the in-flight
-/// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
-pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -177,7 +153,7 @@ impl std::fmt::Display for PermissionMode {
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
-/// `models` path must bypass `Config::from_cli()` entirely — no relay,
+/// `models` path must bypass `Config::from_args()` entirely — no relay,
 /// no private key, no harness setup.
 #[derive(Debug, Parser)]
 #[command(
@@ -198,17 +174,32 @@ pub struct ModelsArgs {
 #[derive(Debug, Parser)]
 pub struct AuthAgentArgs {
     /// Agent binary to spawn (e.g. "goose", "claude-agent-acp", "codex-acp").
-    #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
-    pub agent_command: String,
+    #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND")]
+    pub agent_command: Option<String>,
 
     /// Arguments passed to the agent binary.
-    #[arg(
-        long,
-        env = "BUZZ_ACP_AGENT_ARGS",
-        default_value = "acp",
-        value_delimiter = ','
-    )]
-    pub agent_args: Vec<String>,
+    #[arg(long, env = "BUZZ_ACP_AGENT_ARGS", value_delimiter = ',')]
+    pub agent_args: Option<Vec<String>>,
+
+    /// Settings file holding every tunable (see `buzz-acp.settings.toml`).
+    #[arg(long, env = "BUZZ_ACP_SETTINGS_FILE")]
+    pub settings_file: Option<PathBuf>,
+}
+
+impl AuthAgentArgs {
+    /// Agent command, falling back to `[config] agent_command`. Settings must be initialised.
+    pub fn resolved_command(&self) -> String {
+        self.agent_command
+            .clone()
+            .unwrap_or_else(|| crate::settings::get().config.agent_command.clone())
+    }
+
+    /// Agent args, falling back to `[config] agent_args`. Settings must be initialised.
+    pub fn resolved_args(&self) -> Vec<String> {
+        self.agent_args
+            .clone()
+            .unwrap_or_else(|| crate::settings::get().config.agent_args.clone())
+    }
 }
 
 /// CLI args for `buzz-acp auth-methods` — query adapter-advertised login methods.
@@ -248,8 +239,8 @@ pub struct AuthenticateArgs {
     after_help = "Commands: run (one local task), models, auth-methods, authenticate.\nUse buzz-acp <COMMAND> --help. With no command, start the conversational service."
 )]
 pub struct CliArgs {
-    #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
-    pub relay_url: String,
+    #[arg(long, env = "BUZZ_RELAY_URL")]
+    pub relay_url: Option<String>,
 
     #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
@@ -258,19 +249,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
 
-    #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
-    pub agent_command: String,
+    #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND")]
+    pub agent_command: Option<String>,
 
-    #[arg(
-        long,
-        env = "BUZZ_ACP_AGENT_ARGS",
-        default_value = "acp",
-        value_delimiter = ','
-    )]
-    pub agent_args: Vec<String>,
+    #[arg(long, env = "BUZZ_ACP_AGENT_ARGS", value_delimiter = ',')]
+    pub agent_args: Option<Vec<String>>,
 
-    #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
-    pub mcp_command: String,
+    #[arg(long, env = "BUZZ_ACP_MCP_COMMAND")]
+    pub mcp_command: Option<String>,
 
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
@@ -278,8 +264,8 @@ pub struct CliArgs {
     pub idle_timeout: Option<u64>,
 
     /// Absolute wall-clock cap per turn (safety valve).
-    #[arg(long, env = "BUZZ_ACP_MAX_TURN_DURATION", default_value_t = DEFAULT_MAX_TURN_DURATION_SECS)]
-    pub max_turn_duration: u64,
+    #[arg(long, env = "BUZZ_ACP_MAX_TURN_DURATION")]
+    pub max_turn_duration: Option<u64>,
 
     /// Deprecated: alias for --idle-timeout. If both set, --idle-timeout wins.
     #[arg(long, env = "BUZZ_ACP_TURN_TIMEOUT", hide = true)]
@@ -300,18 +286,17 @@ pub struct CliArgs {
     pub system_prompt_file: Option<PathBuf>,
 
     /// Number of parallel agent subprocesses.
-    #[arg(long, env = "BUZZ_ACP_AGENTS", default_value_t = 1,
-          value_parser = clap::value_parser!(u32).range(1..=32))]
-    pub agents: u32,
+    #[arg(long, env = "BUZZ_ACP_AGENTS")]
+    pub agents: Option<u32>,
 
     /// Seconds between heartbeat prompts. 0 = disabled.
-    #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
-    pub heartbeat_interval: u64,
+    #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL")]
+    pub heartbeat_interval: Option<u64>,
 
     /// Seconds between per-turn liveness pings (the crash backstop signal —
     /// distinct from heartbeat self-prompting). 0 = disabled.
-    #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
-    pub turn_liveness_secs: u64,
+    #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS")]
+    pub turn_liveness_secs: Option<u64>,
 
     /// Heartbeat prompt text. Conflicts with --heartbeat-prompt-file.
     #[arg(
@@ -332,13 +317,8 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_INITIAL_MESSAGE")]
     pub initial_message: Option<String>,
 
-    #[arg(
-        long,
-        env = "BUZZ_ACP_SUBSCRIBE",
-        default_value = "mentions",
-        value_enum
-    )]
-    pub subscribe: SubscribeMode,
+    #[arg(long, env = "BUZZ_ACP_SUBSCRIBE", value_enum)]
+    pub subscribe: Option<SubscribeMode>,
 
     #[arg(long, env = "BUZZ_ACP_KINDS", value_delimiter = ',')]
     pub kinds: Option<Vec<u32>>,
@@ -349,53 +329,42 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_MENTION_FILTER")]
     pub no_mention_filter: bool,
 
-    #[arg(long, env = "BUZZ_ACP_CONFIG", default_value = "./buzz-acp.toml")]
-    pub config: PathBuf,
+    #[arg(long, env = "BUZZ_ACP_CONFIG")]
+    pub config: Option<PathBuf>,
 
-    #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
-    pub dedup: DedupMode,
+    #[arg(long, env = "BUZZ_ACP_DEDUP", value_enum)]
+    pub dedup: Option<DedupMode>,
 
     /// How ACP provider sessions are scoped in channels.
-    /// channel (default): one provider session per channel (legacy behavior).
+    /// channel: one provider session per channel (legacy behavior).
     /// thread: each canonical channel thread gets an isolated provider session;
-    /// direct messages stay conversation-scoped either way. Ships as `channel`
-    /// so thread scoping can be canaried and rolled back without code changes.
-    #[arg(
-        long,
-        env = "BUZZ_ACP_SESSION_POLICY",
-        default_value = "channel",
-        value_enum
-    )]
-    pub session_policy: crate::scope::SessionPolicy,
+    /// direct messages stay conversation-scoped either way. The default comes from
+    /// `[config] session_policy`, so thread scoping can be canaried and rolled back
+    /// without code changes.
+    #[arg(long, env = "BUZZ_ACP_SESSION_POLICY", value_enum)]
+    pub session_policy: Option<crate::scope::SessionPolicy>,
 
     /// How to handle new @mentions while a turn is already in-flight.
-    /// steer (default): cancel+re-prompt, framing the new mention as a message
+    /// steer: cancel+re-prompt, framing the new mention as a message
     /// that arrived mid-task — the agent keeps working and weaves it in.
     /// queue: events wait until the current turn completes.
     /// interrupt: cancel+re-prompt framed as a supersede (new replaces old).
     /// owner-interrupt: interrupt only for the agent owner's mentions.
-    #[arg(
-        long,
-        env = "BUZZ_ACP_MULTIPLE_EVENT_HANDLING",
-        default_value = "steer",
-        value_enum
-    )]
-    pub multiple_event_handling: MultipleEventHandling,
+    #[arg(long, env = "BUZZ_ACP_MULTIPLE_EVENT_HANDLING", value_enum)]
+    pub multiple_event_handling: Option<MultipleEventHandling>,
 
     #[arg(long, env = "BUZZ_ACP_NO_IGNORE_SELF")]
     pub no_ignore_self: bool,
 
     /// Maximum number of context messages to include for thread replies and DMs.
-    /// Set to 0 to disable automatic context fetching. Max 100.
-    #[arg(long, env = "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT", default_value_t = 12,
-          value_parser = clap::value_parser!(u32).range(0..=100))]
-    pub context_message_limit: u32,
+    /// Set to 0 to disable automatic context fetching.
+    #[arg(long, env = "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT")]
+    pub context_message_limit: Option<u32>,
 
     /// Maximum turns per session before proactive rotation. 0 = disabled
     /// (rotate only on MaxTokens / MaxTurnRequests).
-    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION", default_value_t = 0,
-          value_parser = clap::value_parser!(u32))]
-    pub max_turns_per_session: u32,
+    #[arg(long, env = "BUZZ_ACP_MAX_TURNS_PER_SESSION")]
+    pub max_turns_per_session: Option<u32>,
 
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
@@ -407,7 +376,7 @@ pub struct CliArgs {
 
     /// Enable NIP-AE agent core memory injection.
     ///
-    /// Memory injection is on by default. When enabled, the harness
+    /// Memory injection default comes from `[config] memory`. When enabled, the harness
     /// fetches the agent's per-session core engram and renders it as an
     /// `<core-memory>` prompt section (or renders the onboarding nudge
     /// when the relay confirms no core engram exists). The `buzz mem` CLI
@@ -418,13 +387,13 @@ pub struct CliArgs {
         long,
         env = "BUZZ_ACP_MEMORY",
         conflicts_with = "no_memory",
-        default_value_t = true
+        value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub memory: bool,
+    pub memory: Option<Option<bool>>,
 
     /// Disable NIP-AE agent core memory injection.
     ///
-    /// Memory injection is on by default; set this flag/env var to opt out.
+    /// Set this flag/env var to opt out of memory injection.
     #[arg(long, env = "BUZZ_ACP_NO_MEMORY", conflicts_with = "memory")]
     pub no_memory: bool,
 
@@ -464,26 +433,17 @@ pub struct CliArgs {
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
-    /// Defaults to `bypassPermissions` which skips the per-tool-call
-    /// permission flow. Set to `default` to restore the agent's built-in
-    /// behaviour.
-    #[arg(
-        long,
-        env = "BUZZ_ACP_PERMISSION_MODE",
-        default_value = "bypass-permissions",
-        value_enum
-    )]
-    pub permission_mode: PermissionMode,
+    /// `bypassPermissions` skips the per-tool-call permission flow. Set to
+    /// `default` to restore the agent's built-in behaviour. The default comes
+    /// from `[config] permission_mode`.
+    #[arg(long, env = "BUZZ_ACP_PERMISSION_MODE", value_enum)]
+    pub permission_mode: Option<PermissionMode>,
 
     /// Inbound author gate: which authors' events the harness forwards.
-    /// Modes: owner-only (default), allowlist, anyone, nobody.
-    #[arg(
-        long,
-        env = "BUZZ_ACP_RESPOND_TO",
-        default_value = "owner-only",
-        value_enum
-    )]
-    pub respond_to: RespondTo,
+    /// Modes: owner-only, allowlist, anyone, nobody. The default comes from
+    /// `[config] respond_to`.
+    #[arg(long, env = "BUZZ_ACP_RESPOND_TO", value_enum)]
+    pub respond_to: Option<RespondTo>,
 
     /// Comma-separated 64-char hex pubkeys for allowlist mode.
     /// Owner pubkey is always implicitly included.
@@ -503,24 +463,24 @@ pub struct CliArgs {
     pub team_instructions: Option<String>,
 
     /// Publish encrypted ACP observer frames over the relay.
-    #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
+    #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER")]
     pub relay_observer: bool,
 
     /// Exit after this many seconds with no dispatched events and no turn in flight.
     /// 0 disables inactivity self-termination.
-    #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
-    pub exit_after_inactivity: u64,
+    #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY")]
+    pub exit_after_inactivity: Option<u64>,
 
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
-    #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
+    #[arg(long, env = "BUZZ_ACP_LAZY_POOL")]
     pub lazy_pool: bool,
 
     /// Tear the woken pool back down to the lazy empty-slot state after this
     /// many seconds with no dispatched turn in flight and an empty queue,
     /// releasing worker subprocesses until the next accepted event re-wakes.
     /// Requires `--lazy-pool`; ignored otherwise. 0 disables idle re-sleep.
-    #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP", default_value_t = 0)]
-    pub idle_pool_sleep: u64,
+    #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP")]
+    pub idle_pool_sleep: Option<u64>,
 
     /// Unix-seconds replay floor for the startup watermark. A publish-first
     /// mention send publishes the triggering message and then spawns this
@@ -530,6 +490,18 @@ pub struct CliArgs {
     /// ignored (the watermark stays at startup time).
     #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
     pub replay_floor: Option<u64>,
+
+    /// Settings file holding every tunable (see `buzz-acp.settings.toml`).
+    #[arg(long, env = "BUZZ_ACP_SETTINGS_FILE")]
+    pub settings_file: Option<PathBuf>,
+
+    /// Multica API key for the goal loop; required when `[goal]` is configured.
+    #[arg(long, env = "BUZZ_ACP_MULTICA_API_KEY", hide_env_values = true)]
+    pub multica_api_key: Option<String>,
+
+    /// Classifier API key for the goal loop; required when `[goal]` is configured.
+    #[arg(long, env = "BUZZ_ACP_CLASSIFIER_KEY", hide_env_values = true)]
+    pub classifier_key: Option<String>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -631,19 +603,16 @@ pub struct Config {
     /// Disable the `<base>` platform-context section prepended to every prompt.
     pub no_base_prompt: bool,
     /// Resolved content from `--base-prompt-file`, read and validated in
-    /// `from_cli()`. `None` when using the compiled-in default or when
+    /// `from_args()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
 }
 
-/// Maximum length, in characters, of a session title sent to the adapter.
-const SESSION_TITLE_MAX_CHARS: usize = 80;
-
 /// Normalize a configured session title into something safe to hand an adapter.
 ///
 /// Control characters are dropped, runs of whitespace collapse to a single
-/// space, and the result is trimmed and capped at
-/// [`SESSION_TITLE_MAX_CHARS`]. Returns `None` when nothing printable is left.
+/// space, and the result is trimmed and capped at `[config] session_title_max_chars`.
+/// Returns `None` when nothing printable is left.
 ///
 /// Buzz is the only guard here: Codex's own `normalize_thread_name` merely
 /// trims, so an unbounded display name would be persisted verbatim into its
@@ -658,7 +627,7 @@ fn sanitize_session_title(raw: &str) -> Option<String> {
     // Truncate by chars, not bytes, so a multi-byte name can't be cut mid-UTF-8.
     let title: String = collapsed
         .chars()
-        .take(SESSION_TITLE_MAX_CHARS)
+        .take(crate::settings::get().config.session_title_max_chars)
         .collect::<String>()
         .trim_end()
         .to_string();
@@ -669,22 +638,22 @@ fn sanitize_session_title(raw: &str) -> Option<String> {
     }
 }
 
-/// Separator between the agent name and the channel in a composed title.
-/// U+00B7 MIDDLE DOT, spaces on both sides.
-const SESSION_TITLE_SEPARATOR: &str = " · ";
-
 /// Compose a per-session title as `Agent · #channel`.
 ///
 /// One agent in five channels gets five sessions; a bare agent name would show
 /// five identical rows in the adapter's thread list. Only the channel part is
-/// truncated to fit [`SESSION_TITLE_MAX_CHARS`], so the agent name always
+/// truncated to fit `[config] session_title_max_chars`, so the agent name always
 /// survives. Returns the bare agent name when there is no channel, the channel
 /// name is blank, or no room is left for it.
 pub(crate) fn compose_session_title(agent: &str, channel_name: Option<&str>) -> String {
-    compose_session_title_with_limit(agent, channel_name, SESSION_TITLE_MAX_CHARS)
+    compose_session_title_with_limit(
+        agent,
+        channel_name,
+        crate::settings::get().config.session_title_max_chars,
+    )
 }
 
-/// Append the canonical thread root's first eight characters to a session title.
+/// Append the canonical thread root's leading characters to a session title.
 /// Reserve suffix space before truncating names so thread identity always survives.
 /// Conversation and heartbeat sessions preserve their existing title behavior.
 pub(crate) fn compose_scoped_session_title(
@@ -695,9 +664,15 @@ pub(crate) fn compose_scoped_session_title(
     let Some(root) = thread_root.filter(|root| !root.is_empty()) else {
         return compose_session_title(agent, channel_name);
     };
-    let short_root: String = root.chars().take(8).collect();
-    let suffix = format!("{SESSION_TITLE_SEPARATOR}{short_root}");
-    let budget = SESSION_TITLE_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let settings = &crate::settings::get().config;
+    let short_root: String = root
+        .chars()
+        .take(settings.session_title_root_chars)
+        .collect();
+    let suffix = format!("{}{short_root}", settings.session_title_separator);
+    let budget = settings
+        .session_title_max_chars
+        .saturating_sub(suffix.chars().count());
     let agent: String = agent.chars().take(budget).collect();
     format!(
         "{}{suffix}",
@@ -713,8 +688,9 @@ fn compose_session_title_with_limit(
     let Some(channel) = channel_name.and_then(sanitize_session_title) else {
         return agent.to_string();
     };
+    let separator = &crate::settings::get().config.session_title_separator;
     // Reserve the separator and the `#` sigil alongside the agent name.
-    let reserved = agent.chars().count() + SESSION_TITLE_SEPARATOR.chars().count() + 1;
+    let reserved = agent.chars().count() + separator.chars().count() + 1;
     let channel: String = channel
         .chars()
         .take(max_chars.saturating_sub(reserved))
@@ -724,7 +700,7 @@ fn compose_session_title_with_limit(
     if channel.is_empty() {
         return agent.to_string();
     }
-    format!("{agent}{SESSION_TITLE_SEPARATOR}#{channel}")
+    format!("{agent}{separator}#{channel}")
 }
 
 /// Validate and deduplicate allowlist entries: each must be exactly 64 hex chars.
@@ -793,12 +769,12 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
 }
 
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
-    match normalize_agent_command_identity(command).as_str() {
-        "goose" => Some(vec!["acp".to_string()]),
-        "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
-        | "claudecode" | "buzz-agent" => Some(Vec::new()),
-        _ => None,
+    let settings = &crate::settings::get().config;
+    let identity = normalize_agent_command_identity(command);
+    if let Some(args) = settings.default_agent_args.get(&identity) {
+        return Some(args.clone());
     }
+    settings.zero_arg_agents.contains(&identity).then(Vec::new)
 }
 
 /// Per-runtime environment defaults applied when Buzz owns the agent process.
@@ -813,10 +789,19 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// startup budget (see block/buzz#3355). Skip that unrelated global startup
 /// by default; an operator or persona can still opt back in by setting the
 /// variable explicitly.
-pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
-    match normalize_agent_command_identity(command).as_str() {
-        "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
-        _ => &[],
+pub(crate) fn default_agent_env(command: &str) -> Vec<(&'static str, &'static str)> {
+    let settings = &crate::settings::get().config;
+    if settings
+        .hermes_commands
+        .contains(&normalize_agent_command_identity(command))
+    {
+        settings
+            .hermes_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -827,7 +812,7 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
 /// that blocks all outbound network by default. Without this env var, `buzz-cli`
 /// requests are blocked before they can reach the relay WebSocket.
 ///
-/// Returns `Some(("CODEX_CONFIG", "{\"sandbox_workspace_write\":{\"network_access\":true}}"))` for
+/// Returns `Some(("CODEX_CONFIG", <[config] codex_config_json>))` for
 /// Codex agents, or `None` for non-Codex agents or when the relay URL cannot be parsed.
 ///
 /// The env var is forwarded by the `@agentclientprotocol/codex-acp` adapter (1.x) as a
@@ -841,9 +826,12 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
 ///
 /// Handles `ws://`, `wss://`, `http://`, and `https://` schemes.
 pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String, String)> {
-    match normalize_agent_command_identity(agent_command).as_str() {
-        "codex" | "codex-acp" => {}
-        _ => return None,
+    let settings = &crate::settings::get().config;
+    if !settings
+        .codex_commands
+        .contains(&normalize_agent_command_identity(agent_command))
+    {
+        return None;
     }
 
     // Validate the relay URL before injecting broader network access. On parse failure,
@@ -867,10 +855,7 @@ pub fn codex_network_env(agent_command: &str, relay_url: &str) -> Option<(String
 
     tracing::debug!(host, "injecting CODEX_CONFIG network_access for relay host");
 
-    Some((
-        "CODEX_CONFIG".into(),
-        "{\"sandbox_workspace_write\":{\"network_access\":true}}".into(),
-    ))
+    Some(("CODEX_CONFIG".into(), settings.codex_config_json.clone()))
 }
 
 pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<String> {
@@ -922,20 +907,30 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
-impl Config {
-    pub fn from_cli() -> Result<Self, ConfigError> {
-        // Legacy env-var propagation is intentionally NOT done here.
-        // Call `propagate_legacy_env_vars()` before the tokio runtime starts
-        // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
-        let args = CliArgs::parse();
-        Self::from_args(args)
-    }
+fn setting_enum<T: ValueEnum>(key: &str, raw: &str) -> Result<T, ConfigError> {
+    T::from_str(raw, true).map_err(|error| {
+        ConfigError::ConfigFile(format!("settings [config] {key} = '{raw}': {error}"))
+    })
+}
 
-    /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
-    /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
-    /// validation path without going through process args.
+impl Config {
+    /// Build a `Config` from already-parsed `CliArgs`, so tests can construct
+    /// `CliArgs` via `CliArgs::try_parse_from` and exercise the full validation path
+    /// without going through process args.
+    ///
+    /// Legacy env-var propagation is intentionally NOT done here. Call
+    /// `propagate_legacy_env_vars()` before the tokio runtime starts (in the sync
+    /// `fn main()` wrapper) — see Rust 2024 edition safety.
+    ///
+    /// Settings must already be initialised (`settings::init_from`); every CLI option
+    /// left unset resolves from `[config]` here, once.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        let settings = &crate::settings::get().config;
         let keys = Keys::parse(&args.private_key)?;
+        let relay_url = args
+            .relay_url
+            .take()
+            .unwrap_or_else(|| settings.relay_url.clone());
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
         // crate we can only clear the String — the allocator may retain copies.
@@ -951,16 +946,24 @@ impl Config {
             None
         };
 
-        if args.heartbeat_interval > 0 && args.heartbeat_interval < 10 {
-            return Err(ConfigError::ConfigFile(
-                "heartbeat interval must be 0 (disabled) or ≥10 seconds".into(),
-            ));
+        let heartbeat_interval = args
+            .heartbeat_interval
+            .unwrap_or(settings.heartbeat_interval_secs.as_secs());
+        let heartbeat_min = settings.heartbeat_interval_min_secs.as_secs();
+        if heartbeat_interval > 0 && heartbeat_interval < heartbeat_min {
+            return Err(ConfigError::ConfigFile(format!(
+                "heartbeat interval must be 0 (disabled) or ≥{heartbeat_min} seconds"
+            )));
         }
 
-        if args.turn_liveness_secs > 0 && args.turn_liveness_secs < 5 {
-            return Err(ConfigError::ConfigFile(
-                "turn liveness interval must be 0 (disabled) or ≥5 seconds".into(),
-            ));
+        let turn_liveness_secs = args
+            .turn_liveness_secs
+            .unwrap_or(settings.turn_liveness_secs.as_secs());
+        let liveness_min = settings.turn_liveness_min_secs.as_secs();
+        if turn_liveness_secs > 0 && turn_liveness_secs < liveness_min {
+            return Err(ConfigError::ConfigFile(format!(
+                "turn liveness interval must be 0 (disabled) or ≥{liveness_min} seconds"
+            )));
         }
 
         let heartbeat_prompt = if let Some(text) = args.heartbeat_prompt {
@@ -975,10 +978,11 @@ impl Config {
             None
         } else if let Some(ref path) = args.base_prompt_file {
             let content = std::fs::read_to_string(path)?;
-            if content.len() > 1_048_576 {
+            if content.len() > settings.base_prompt_max_bytes {
                 return Err(ConfigError::ConfigFile(format!(
-                    "base prompt file {} exceeds 1 MB limit ({} bytes)",
+                    "base prompt file {} exceeds {} byte limit ({} bytes)",
                     path.display(),
+                    settings.base_prompt_max_bytes,
                     content.len()
                 )));
             }
@@ -987,7 +991,49 @@ impl Config {
             None
         };
 
-        if matches!(args.subscribe, SubscribeMode::Config) {
+        let subscribe = match args.subscribe {
+            Some(mode) => mode,
+            None => setting_enum("subscribe", &settings.subscribe)?,
+        };
+        let dedup = match args.dedup {
+            Some(mode) => mode,
+            None => setting_enum("dedup", &settings.dedup)?,
+        };
+        let session_policy = match args.session_policy {
+            Some(policy) => policy,
+            None => setting_enum("session_policy", &settings.session_policy)?,
+        };
+        let multiple_event_handling = match args.multiple_event_handling {
+            Some(handling) => handling,
+            None => setting_enum("multiple_event_handling", &settings.multiple_event_handling)?,
+        };
+        let permission_mode = match args.permission_mode {
+            Some(mode) => mode,
+            None => setting_enum("permission_mode", &settings.permission_mode)?,
+        };
+        let respond_to = match args.respond_to {
+            Some(mode) => mode,
+            None => setting_enum("respond_to", &settings.respond_to)?,
+        };
+
+        let agents = args.agents.unwrap_or(settings.agents);
+        if !(1..=settings.agents_max).contains(&agents) {
+            return Err(ConfigError::ConfigFile(format!(
+                "agents ({agents}) must be between 1 and {}",
+                settings.agents_max
+            )));
+        }
+        let context_message_limit = args
+            .context_message_limit
+            .unwrap_or(settings.context_message_limit);
+        if context_message_limit > settings.context_message_limit_max {
+            return Err(ConfigError::ConfigFile(format!(
+                "context message limit ({context_message_limit}) must be at most {}",
+                settings.context_message_limit_max
+            )));
+        }
+
+        if matches!(subscribe, SubscribeMode::Config) {
             if args.kinds.is_some() {
                 tracing::warn!("--kinds is ignored in config mode");
             }
@@ -999,7 +1045,9 @@ impl Config {
             }
         }
 
-        let agent_command = args.agent_command;
+        let agent_command = args
+            .agent_command
+            .unwrap_or_else(|| settings.agent_command.clone());
 
         if agent_command.trim().is_empty() {
             return Err(ConfigError::ConfigFile(
@@ -1007,7 +1055,11 @@ impl Config {
             ));
         }
 
-        let agent_args = normalize_agent_args(&agent_command, args.agent_args);
+        let agent_args = normalize_agent_args(
+            &agent_command,
+            args.agent_args
+                .unwrap_or_else(|| settings.agent_args.clone()),
+        );
 
         if let Some(ref channels) = args.channels {
             for ch in channels {
@@ -1020,29 +1072,32 @@ impl Config {
             }
         }
 
-        let heartbeat_interval = if args.heartbeat_interval > 86400 {
+        let interval_max = settings.interval_max_secs.as_secs();
+        let heartbeat_interval = if heartbeat_interval > interval_max {
             tracing::warn!(
-                interval = args.heartbeat_interval,
-                "heartbeat interval exceeds 24h — capping at 86400s"
+                interval = heartbeat_interval,
+                max = interval_max,
+                "heartbeat interval exceeds the cap — capping"
             );
-            86400u64
+            interval_max
         } else {
-            args.heartbeat_interval
+            heartbeat_interval
         };
 
-        // Cap turn-liveness interval at 86400s (24h) — same bound as heartbeat.
-        let turn_liveness_secs = if args.turn_liveness_secs > 86400 {
+        // Same bound as heartbeat.
+        let turn_liveness_secs = if turn_liveness_secs > interval_max {
             tracing::warn!(
-                interval = args.turn_liveness_secs,
-                "turn liveness interval exceeds 24h — capping at 86400s"
+                interval = turn_liveness_secs,
+                max = interval_max,
+                "turn liveness interval exceeds the cap — capping"
             );
-            86400u64
+            interval_max
         } else {
-            args.turn_liveness_secs
+            turn_liveness_secs
         };
 
         // Resolve idle_timeout_secs with deprecation handling.
-        // Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
+        // Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `[config] default_idle_timeout_secs`.
         let idle_timeout_secs = {
             let raw = match (args.idle_timeout, args.turn_timeout) {
                 (Some(idle), Some(_turn)) => {
@@ -1060,25 +1115,32 @@ impl Config {
                     );
                     turn
                 }
-                (None, None) => DEFAULT_IDLE_TIMEOUT_SECS,
+                (None, None) => settings.default_idle_timeout_secs.as_secs(),
             };
             if raw == 0 {
-                tracing::warn!("idle timeout of 0 is invalid — using 1s minimum");
-                1
+                let floor = settings.idle_timeout_floor_secs.as_secs();
+                tracing::warn!(floor, "idle timeout of 0 is invalid — using the minimum");
+                floor
             } else {
                 raw
             }
         };
 
         let max_turn_duration_secs = {
-            let raw = args.max_turn_duration;
+            let raw = args
+                .max_turn_duration
+                .unwrap_or(settings.max_turn_duration_secs.as_secs());
+            let ceiling = settings.max_turn_duration_ceiling_secs.as_secs();
             if raw == 0 {
-                tracing::warn!("max turn duration of 0 is invalid — using 60s minimum");
-                60
-            } else if raw > MAX_TURN_DURATION_CEILING_SECS {
+                let floor = settings.max_turn_duration_floor_secs.as_secs();
+                tracing::warn!(
+                    floor,
+                    "max turn duration of 0 is invalid — using the minimum"
+                );
+                floor
+            } else if raw > ceiling {
                 return Err(ConfigError::ConfigFile(format!(
-                    "max_turn_duration ({}s) exceeds ceiling ({}s / 7 days)",
-                    raw, MAX_TURN_DURATION_CEILING_SECS
+                    "max_turn_duration ({raw}s) exceeds ceiling ({ceiling}s)"
                 )));
             } else {
                 raw
@@ -1095,7 +1157,7 @@ impl Config {
             )));
         }
 
-        let respond_to_allowlist = if args.respond_to == RespondTo::Allowlist {
+        let respond_to_allowlist = if respond_to == RespondTo::Allowlist {
             let raw = args.respond_to_allowlist.unwrap_or_default();
             if raw.is_empty() {
                 return Err(ConfigError::ConfigFile(
@@ -1124,11 +1186,11 @@ impl Config {
                 })?;
             }
             let allowed_modes: Vec<String> = raw.iter().map(|s| s.trim().to_string()).collect();
-            if !allowed_modes.is_empty() && !allowed_modes.contains(&args.respond_to.to_string()) {
+            if !allowed_modes.is_empty() && !allowed_modes.contains(&respond_to.to_string()) {
                 return Err(ConfigError::ConfigFile(format!(
                     "respond_to '{}' is not permitted on this deployment \
                      (BUZZ_ACP_ALLOWED_RESPOND_TO={})",
-                    args.respond_to,
+                    respond_to,
                     raw.join(",")
                 )));
             }
@@ -1146,24 +1208,26 @@ impl Config {
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
         let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
+            if let Some(network_env) = codex_network_env(&agent_command, &relay_url) {
                 persona_env_vars.push(network_env);
                 true
             } else {
                 false
             };
 
-        validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
+        validate_multiple_event_handling(multiple_event_handling, dedup)?;
 
         let config = Config {
             keys,
-            relay_url: args.relay_url,
+            relay_url,
             agent_command,
             agent_args,
-            mcp_command: args.mcp_command,
+            mcp_command: args
+                .mcp_command
+                .unwrap_or_else(|| settings.mcp_command.clone()),
             idle_timeout_secs,
             max_turn_duration_secs,
-            agents: args.agents,
+            agents,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
             heartbeat_prompt,
@@ -1175,36 +1239,48 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
             initial_message: args.initial_message,
-            subscribe_mode: args.subscribe,
-            dedup_mode: args.dedup,
-            session_policy: args.session_policy,
-            multiple_event_handling: args.multiple_event_handling,
+            subscribe_mode: subscribe,
+            dedup_mode: dedup,
+            session_policy,
+            multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
             channels_override: args.channels,
             no_mention_filter: args.no_mention_filter,
-            config_path: args.config,
-            context_message_limit: args.context_message_limit,
-            max_turns_per_session: args.max_turns_per_session,
+            config_path: args
+                .config
+                .unwrap_or_else(|| PathBuf::from(&settings.config_file)),
+            context_message_limit,
+            max_turns_per_session: args
+                .max_turns_per_session
+                .unwrap_or(settings.max_turns_per_session),
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
-            memory_enabled: args.memory && !args.no_memory,
+            memory_enabled: args
+                .memory
+                .map(|flag| flag.unwrap_or(true))
+                .unwrap_or(settings.memory)
+                && !args.no_memory,
             model,
             effort_level: args.effort_level,
             session_title: args
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
-            permission_mode: args.permission_mode,
-            respond_to: args.respond_to,
+            permission_mode,
+            respond_to,
             respond_to_allowlist,
             allowed_respond_to,
             persona_env_vars,
             has_generated_codex_config,
-            relay_observer: args.relay_observer,
-            exit_after_inactivity_secs: args.exit_after_inactivity,
-            lazy_pool: args.lazy_pool,
-            idle_pool_sleep_secs: args.idle_pool_sleep,
+            relay_observer: args.relay_observer || settings.relay_observer,
+            exit_after_inactivity_secs: args
+                .exit_after_inactivity
+                .unwrap_or(settings.exit_after_inactivity_secs.as_secs()),
+            lazy_pool: args.lazy_pool || settings.lazy_pool,
+            idle_pool_sleep_secs: args
+                .idle_pool_sleep
+                .unwrap_or(settings.idle_pool_sleep_secs.as_secs()),
             replay_floor_unix: args.replay_floor,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
@@ -1250,7 +1326,9 @@ impl Config {
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
-            self.model.as_deref().unwrap_or("(agent default)"),
+            self.model
+                .as_deref()
+                .unwrap_or(&crate::settings::get().config.agent_default_display),
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
@@ -1272,9 +1350,10 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
     let mut config: TomlConfig =
         toml::from_str(&content).map_err(|e| ConfigError::ConfigFile(e.to_string()))?;
 
-    if config.rules.len() > 100 {
+    let max_rules = crate::settings::get().config.max_rules;
+    if config.rules.len() > max_rules {
         return Err(ConfigError::ConfigFile(format!(
-            "too many rules ({}, max 100)",
+            "too many rules ({}, max {max_rules})",
             config.rules.len()
         )));
     }
@@ -1300,9 +1379,10 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
             )));
         }
         if let Some(ref expr) = rule.filter {
-            if expr.len() > 4096 {
+            let max_expr_len = crate::settings::get().filter.max_expr_len;
+            if expr.len() > max_expr_len {
                 return Err(ConfigError::ConfigFile(format!(
-                    "rule '{}': filter too long ({} bytes, max 4096)",
+                    "rule '{}': filter too long ({} bytes, max {max_expr_len})",
                     rule.name,
                     expr.len()
                 )));
@@ -1343,12 +1423,7 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 /// recipients newly added by an edit. Receiving kind 40003 therefore wakes an
 /// agent once for a newly added mention without re-waking it for ordinary edits.
 pub(crate) fn default_mention_kinds() -> Vec<u32> {
-    vec![
-        KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_EDIT,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
-        KIND_STREAM_REMINDER,
-    ]
+    crate::settings::get().config.default_mention_kinds.clone()
 }
 
 /// Resolve per-channel NIP-01 filters from config + discovered channels.
@@ -1539,16 +1614,46 @@ mod tests {
     use crate::filter::{ChannelScope, SubscriptionRule};
     use clap::{Parser, ValueEnum};
 
+    fn test_settings() -> &'static crate::settings::ConfigSettings {
+        crate::settings::init_for_tests();
+        &crate::settings::get().config
+    }
+
+    fn default_idle_secs() -> u64 {
+        test_settings().default_idle_timeout_secs.as_secs()
+    }
+
+    fn default_max_turn_secs() -> u64 {
+        test_settings().max_turn_duration_secs.as_secs()
+    }
+
+    fn ceiling_secs() -> u64 {
+        test_settings().max_turn_duration_ceiling_secs.as_secs()
+    }
+
+    fn title_max() -> usize {
+        test_settings().session_title_max_chars
+    }
+
+    /// Resolve a `Config` from CLI args with a valid test key; settings supply every default.
+    fn config_from(extra: &[&str]) -> Config {
+        crate::settings::init_for_tests();
+        let mut argv = vec!["buzz-acp", "--private-key", TEST_PRIVATE_KEY];
+        argv.extend_from_slice(extra);
+        Config::from_args(CliArgs::parse_from(argv)).expect("valid test args")
+    }
+
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
+        crate::settings::init_for_tests();
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
-            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
+            idle_timeout_secs: default_idle_secs(),
+            max_turn_duration_secs: default_max_turn_secs(),
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
@@ -1639,7 +1744,7 @@ mod tests {
             filter
                 .kinds
                 .expect("mentions mode should constrain kinds")
-                .contains(&KIND_STREAM_MESSAGE_EDIT),
+                .contains(&buzz_core::kind::KIND_STREAM_MESSAGE_EDIT),
             "newly mentioned agents must receive message edits on dynamic channels"
         );
     }
@@ -1668,12 +1773,14 @@ mod tests {
 
     #[test]
     fn normalizes_goose_args_to_acp() {
+        crate::settings::init_for_tests();
         assert_eq!(normalize_agent_args("goose", Vec::new()), vec!["acp"]);
         assert_eq!(normalize_agent_args("goose", vec!["".into()]), vec!["acp"]);
     }
 
     #[test]
     fn normalizes_codex_and_claude_args_to_empty() {
+        crate::settings::init_for_tests();
         assert_eq!(
             normalize_agent_args("codex-acp", Vec::new()),
             Vec::<String>::new()
@@ -1702,6 +1809,7 @@ mod tests {
 
     #[test]
     fn preserves_explicit_nonempty_agent_args() {
+        crate::settings::init_for_tests();
         assert_eq!(
             normalize_agent_args("codex-acp", vec!["-c".into(), "model=\"gpt-5\"".into()]),
             vec!["-c", "model=\"gpt-5\""]
@@ -1714,6 +1822,7 @@ mod tests {
 
     #[test]
     fn normalizes_buzz_agent_args_to_empty() {
+        crate::settings::init_for_tests();
         assert_eq!(
             normalize_agent_args("buzz-agent", Vec::new()),
             Vec::<String>::new()
@@ -1765,6 +1874,7 @@ mod tests {
 
     #[test]
     fn default_agent_env_recognizes_hermes_identities() {
+        crate::settings::init_for_tests();
         for command in [
             "hermes",
             "hermes-agent",
@@ -1775,7 +1885,7 @@ mod tests {
         ] {
             assert_eq!(
                 default_agent_env(command),
-                &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
+                [("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
                 "unexpected env defaults for {command}"
             );
         }
@@ -1789,6 +1899,7 @@ mod tests {
 
     #[test]
     fn strips_legacy_acp_arg_case_insensitively() {
+        crate::settings::init_for_tests();
         assert_eq!(
             normalize_agent_args("codex-acp", vec!["ACP".into()]),
             Vec::<String>::new()
@@ -1801,6 +1912,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_wss_url() {
+        crate::settings::init_for_tests();
         let result = codex_network_env("codex-acp", "wss://sprout-oss.stage.blox.sqprod.co");
         assert_eq!(
             result,
@@ -1810,6 +1922,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_ws_url() {
+        crate::settings::init_for_tests();
         let result = codex_network_env("codex-acp", "ws://localhost:3000");
         assert_eq!(
             result,
@@ -1819,6 +1932,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_https_url() {
+        crate::settings::init_for_tests();
         let result = codex_network_env("codex-acp", "https://relay.example.com/path");
         assert_eq!(
             result,
@@ -1828,6 +1942,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_http_url_with_port() {
+        crate::settings::init_for_tests();
         let result = codex_network_env("codex-acp", "http://relay.example.com:8080/query");
         assert_eq!(
             result,
@@ -1837,6 +1952,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_bare_codex_command() {
+        crate::settings::init_for_tests();
         // "codex" (not "codex-acp") should also get the env var.
         let result = codex_network_env("codex", "wss://relay.example.com");
         assert_eq!(
@@ -1847,6 +1963,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_full_path_codex_command() {
+        crate::settings::init_for_tests();
         // Full path like /usr/local/bin/codex-acp should be normalized.
         let result = codex_network_env("/usr/local/bin/codex-acp", "wss://relay.example.com");
         assert_eq!(
@@ -1857,6 +1974,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_non_codex_agent_returns_none() {
+        crate::settings::init_for_tests();
         assert!(codex_network_env("goose", "wss://relay.example.com").is_none());
         assert!(codex_network_env("claude-agent-acp", "wss://relay.example.com").is_none());
         assert!(codex_network_env("buzz-agent", "wss://relay.example.com").is_none());
@@ -1864,6 +1982,7 @@ mod tests {
 
     #[test]
     fn codex_network_env_includes_sandbox_network_access() {
+        crate::settings::init_for_tests();
         // The JSON value must set sandbox_workspace_write.network_access=true — without
         // it, the Seatbelt sandbox blocks outbound connections in the 1.x adapter.
         let result = codex_network_env("codex-acp", "wss://relay.example.com");
@@ -1881,12 +2000,14 @@ mod tests {
 
     #[test]
     fn codex_network_env_empty_relay_url_returns_none() {
+        crate::settings::init_for_tests();
         // Empty string fails Url::parse — graceful None return.
         assert!(codex_network_env("codex-acp", "").is_none());
     }
 
     #[test]
     fn codex_network_env_schemeless_string_returns_none() {
+        crate::settings::init_for_tests();
         // A bare string with no scheme fails Url::parse — graceful None return.
         assert!(codex_network_env("codex-acp", "not-a-url").is_none());
     }
@@ -2079,6 +2200,7 @@ mod tests {
 
     #[test]
     fn test_load_rules_valid_toml() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-valid");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2102,6 +2224,7 @@ require_mention = false
 
     #[test]
     fn test_load_rules_empty_name_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-empty-name");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2122,6 +2245,7 @@ channels = "all"
 
     #[test]
     fn test_load_rules_duplicate_name_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-dup-name");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2146,6 +2270,7 @@ channels = "all"
 
     #[test]
     fn test_load_rules_invalid_filter_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-bad-filter");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2168,6 +2293,7 @@ filter = "((("
 
     #[test]
     fn test_load_rules_channel_scope_typo_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-scope-typo");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2188,6 +2314,7 @@ channels = "ALL"
 
     #[test]
     fn test_load_rules_too_many_rules_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-too-many");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2206,6 +2333,7 @@ channels = "ALL"
 
     #[test]
     fn test_load_rules_filter_too_long_rejected() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join("buzz-acp-test-long-filter");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2302,8 +2430,7 @@ channels = "ALL"
     #[test]
     fn inactivity_exit_defaults_disabled_and_accepts_cli_value() {
         let key = "0".repeat(64);
-        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
-        assert_eq!(default.exit_after_inactivity, 0);
+        assert_eq!(config_from(&[]).exit_after_inactivity_secs, 0);
 
         let configured = CliArgs::parse_from([
             "buzz-acp",
@@ -2312,20 +2439,18 @@ channels = "ALL"
             "--exit-after-inactivity",
             "120",
         ]);
-        assert_eq!(configured.exit_after_inactivity, 120);
+        assert_eq!(configured.exit_after_inactivity, Some(120));
     }
 
     #[test]
     fn lazy_pool_defaults_off() {
-        let key = "0".repeat(64);
-        assert!(!CliArgs::parse_from(["buzz-acp", "--private-key", &key]).lazy_pool);
+        assert!(!config_from(&[]).lazy_pool);
     }
 
     #[test]
     fn idle_pool_sleep_defaults_disabled_and_accepts_cli_value() {
         let key = "0".repeat(64);
-        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
-        assert_eq!(default.idle_pool_sleep, 0);
+        assert_eq!(config_from(&[]).idle_pool_sleep_secs, 0);
 
         let configured = CliArgs::parse_from([
             "buzz-acp",
@@ -2334,7 +2459,7 @@ channels = "ALL"
             "--idle-pool-sleep",
             "300",
         ]);
-        assert_eq!(configured.idle_pool_sleep, 300);
+        assert_eq!(configured.idle_pool_sleep, Some(300));
     }
 
     #[test]
@@ -2523,13 +2648,13 @@ channels = "ALL"
     }
 
     /// Helper: resolve idle_timeout_secs using the same precedence logic as Config::from_args.
-    /// Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
+    /// Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `[config] default_idle_timeout_secs`.
     fn resolve_idle_timeout(idle: Option<u64>, turn: Option<u64>) -> u64 {
         let raw = match (idle, turn) {
             (Some(idle), Some(_)) => idle,
             (Some(idle), None) => idle,
             (None, Some(turn)) => turn,
-            (None, None) => DEFAULT_IDLE_TIMEOUT_SECS,
+            (None, None) => default_idle_secs(),
         };
         if raw == 0 {
             1
@@ -2550,7 +2675,7 @@ channels = "ALL"
 
     #[test]
     fn idle_timeout_defaults_to_constant_when_neither_set() {
-        assert_eq!(resolve_idle_timeout(None, None), DEFAULT_IDLE_TIMEOUT_SECS);
+        assert_eq!(resolve_idle_timeout(None, None), default_idle_secs());
     }
 
     #[test]
@@ -2567,13 +2692,13 @@ channels = "ALL"
     fn test_config_summary_includes_idle_and_max_turn() {
         let config = test_config(SubscribeMode::Mentions);
         let summary = config.summary();
-        let expected_idle = format!("idle_timeout={DEFAULT_IDLE_TIMEOUT_SECS}s");
+        let expected_idle = format!("idle_timeout={}s", default_idle_secs());
         assert!(
             summary.contains(&expected_idle),
             "summary should include {expected_idle}: {summary}"
         );
         assert!(
-            summary.contains(&format!("max_turn={DEFAULT_MAX_TURN_DURATION_SECS}s")),
+            summary.contains(&format!("max_turn={}s", default_max_turn_secs())),
             "summary should include max_turn: {summary}"
         );
     }
@@ -2712,8 +2837,10 @@ channels = "ALL"
     fn test_session_policy_default_is_channel() {
         // Ships dark: the default must be `channel` so thread scoping is opt-in
         // and can be rolled back without code changes.
-        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
-        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Channel);
+        assert_eq!(
+            config_from(&[]).session_policy,
+            crate::scope::SessionPolicy::Channel
+        );
     }
 
     #[test]
@@ -2725,7 +2852,10 @@ channels = "ALL"
             "--session-policy",
             "thread",
         ]);
-        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
+        assert_eq!(
+            args.session_policy,
+            Some(crate::scope::SessionPolicy::Thread)
+        );
     }
 
     #[test]
@@ -2738,8 +2868,11 @@ channels = "ALL"
             &"0".repeat(64),
             "--session-policy=thread",
         ]);
-        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
-        assert_eq!(args.session_policy.to_string(), "thread");
+        assert_eq!(
+            args.session_policy,
+            Some(crate::scope::SessionPolicy::Thread)
+        );
+        assert_eq!(args.session_policy.unwrap().to_string(), "thread");
     }
 
     // ── Multiple-event-handling validation + default ──────────────────────────
@@ -2748,10 +2881,10 @@ channels = "ALL"
     fn test_multiple_event_handling_default_is_steer() {
         // Parse a minimal arg set; the default for --multiple-event-handling
         // must be `steer` (steering is the default mid-turn delivery path).
-        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
-        assert_eq!(args.multiple_event_handling, MultipleEventHandling::Steer);
+        let config = config_from(&[]);
+        assert_eq!(config.multiple_event_handling, MultipleEventHandling::Steer);
         // Dedup default must remain `queue` so steering's requirement is met.
-        assert!(matches!(args.dedup, DedupMode::Queue));
+        assert!(matches!(config.dedup_mode, DedupMode::Queue));
     }
 
     #[test]
@@ -2800,11 +2933,12 @@ channels = "ALL"
     #[test]
     fn default_idle_timeout_is_1500_seconds() {
         // Lock the constant value so accidental changes are caught.
-        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 1_500);
+        assert_eq!(default_idle_secs(), 1_500);
     }
 
     #[test]
     fn idle_timeout_must_be_less_than_max_turn_duration() {
+        crate::settings::init_for_tests();
         // The guard in Config::from_args rejects idle >= max_turn.
         // Exercise the same logic: if idle >= max_turn, it's invalid.
         let idle = 3600u64;
@@ -2814,10 +2948,8 @@ channels = "ALL"
             "test precondition: idle must be >= max_turn to trigger guard"
         );
 
-        // And the valid case (const assertion so clippy doesn't flag it):
-        const {
-            assert!(DEFAULT_IDLE_TIMEOUT_SECS < DEFAULT_MAX_TURN_DURATION_SECS);
-        }
+        // And the valid case.
+        assert!(default_idle_secs() < default_max_turn_secs());
     }
 
     #[test]
@@ -2825,7 +2957,7 @@ channels = "ALL"
         // Asserts the three-layer budget relationship introduced in PR #7185:
         //   buzz-dev-mcp MAX_TIMEOUT_MS (1 200 000 ms = 1 200s)
         //   ≤ buzz-agent BUZZ_AGENT_TOOL_TIMEOUT_SECS default (1 260s)
-        //   < buzz-acp DEFAULT_IDLE_TIMEOUT_SECS (1 500s)
+        //   < buzz-acp default idle timeout (1 500s)
         //
         // The idle deadline must strictly outlast the agent tool timeout so a
         // legitimately long-running tool call is killed by buzz-agent first (at
@@ -2846,17 +2978,17 @@ channels = "ALL"
                 SHELL_CAP_SECS <= AGENT_TOOL_TIMEOUT_SECS,
                 "shell cap must be <= agent tool timeout"
             );
-            // Agent tool timeout must be strictly less than the ACP idle deadline.
-            assert!(
-                AGENT_TOOL_TIMEOUT_SECS < DEFAULT_IDLE_TIMEOUT_SECS,
-                "agent tool timeout must be < ACP idle timeout"
-            );
-            // ACP idle timeout must remain below the max turn duration.
-            assert!(
-                DEFAULT_IDLE_TIMEOUT_SECS < DEFAULT_MAX_TURN_DURATION_SECS,
-                "ACP idle timeout must be < max turn duration"
-            );
         }
+        // Agent tool timeout must be strictly less than the ACP idle deadline.
+        assert!(
+            AGENT_TOOL_TIMEOUT_SECS < default_idle_secs(),
+            "agent tool timeout must be < ACP idle timeout"
+        );
+        // ACP idle timeout must remain below the max turn duration.
+        assert!(
+            default_idle_secs() < default_max_turn_secs(),
+            "ACP idle timeout must be < max turn duration"
+        );
     }
 
     // --- BUZZ_ACP_ALLOWED_RESPOND_TO gate ---
@@ -2974,6 +3106,7 @@ channels = "ALL"
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
+        crate::settings::init_for_tests();
         // --allowed-respond-to=owner-only,allowlist + --respond-to=anyone → ConfigError
         let args = CliArgs::try_parse_from([
             "buzz-acp",
@@ -3004,6 +3137,7 @@ channels = "ALL"
 
     #[test]
     fn allowed_respond_to_full_path_accepts_allowed_mode() {
+        crate::settings::init_for_tests();
         // --allowed-respond-to=owner-only,allowlist + --respond-to=owner-only → Ok
         let args = CliArgs::try_parse_from([
             "buzz-acp",
@@ -3025,6 +3159,7 @@ channels = "ALL"
 
     #[test]
     fn allowed_respond_to_full_path_unset_allows_all() {
+        crate::settings::init_for_tests();
         // No --allowed-respond-to flag → anyone is accepted.
         let args = CliArgs::try_parse_from([
             "buzz-acp",
@@ -3046,12 +3181,13 @@ channels = "ALL"
 
     #[test]
     fn max_turn_duration_at_ceiling_is_accepted() {
+        crate::settings::init_for_tests();
         let args = CliArgs::try_parse_from([
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
             "--max-turn-duration",
-            &MAX_TURN_DURATION_CEILING_SECS.to_string(),
+            &ceiling_secs().to_string(),
         ])
         .expect("clap should parse args");
         let result = Config::from_args(args);
@@ -3064,7 +3200,8 @@ channels = "ALL"
 
     #[test]
     fn max_turn_duration_above_ceiling_is_rejected() {
-        let over = MAX_TURN_DURATION_CEILING_SECS + 1;
+        crate::settings::init_for_tests();
+        let over = ceiling_secs() + 1;
         let args = CliArgs::try_parse_from([
             "buzz-acp",
             "--private-key",
@@ -3090,13 +3227,12 @@ channels = "ALL"
     fn max_turn_duration_ceiling_cannot_overflow_in_flight_deadline() {
         // The in-flight deadline is max_turn + 100s buffer (IN_FLIGHT_DEADLINE_BUFFER_SECS).
         // Verify that even at the ceiling, this addition cannot overflow u64.
-        const {
-            assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
-        }
+        assert!(ceiling_secs() < u64::MAX - 100);
     }
 
     #[test]
     fn sanitize_session_title_collapses_whitespace_and_strips_control_chars() {
+        crate::settings::init_for_tests();
         assert_eq!(
             sanitize_session_title("  Fizz\t\tthe\n Bot\u{7}  "),
             Some("Fizz the Bot".to_string())
@@ -3105,6 +3241,7 @@ channels = "ALL"
 
     #[test]
     fn sanitize_session_title_returns_none_when_nothing_printable_remains() {
+        crate::settings::init_for_tests();
         assert_eq!(sanitize_session_title("   \n\t "), None);
         assert_eq!(sanitize_session_title(""), None);
         assert_eq!(sanitize_session_title("\u{1}\u{2}"), None);
@@ -3112,22 +3249,25 @@ channels = "ALL"
 
     #[test]
     fn sanitize_session_title_caps_length_without_splitting_multibyte_chars() {
-        let raw = "\u{1f41d}".repeat(SESSION_TITLE_MAX_CHARS + 10);
+        crate::settings::init_for_tests();
+        let raw = "\u{1f41d}".repeat(title_max() + 10);
         let title = sanitize_session_title(&raw).expect("emoji title survives sanitizing");
-        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert_eq!(title.chars().count(), title_max());
         assert!(title.chars().all(|c| c == '\u{1f41d}'));
     }
 
     #[test]
     fn sanitize_session_title_does_not_leave_a_trailing_space_after_the_cap() {
+        crate::settings::init_for_tests();
         // The cap lands mid-word, so trimming must not leave a dangling space.
-        let raw = format!("{} tail", "a".repeat(SESSION_TITLE_MAX_CHARS - 1));
+        let raw = format!("{} tail", "a".repeat(title_max() - 1));
         let title = sanitize_session_title(&raw).expect("title survives sanitizing");
-        assert_eq!(title, "a".repeat(SESSION_TITLE_MAX_CHARS - 1));
+        assert_eq!(title, "a".repeat(title_max() - 1));
     }
 
     #[test]
     fn compose_session_title_qualifies_the_agent_name_with_the_channel() {
+        crate::settings::init_for_tests();
         assert_eq!(
             compose_session_title("Fizz", Some("buzz-dev")),
             "Fizz · #buzz-dev"
@@ -3136,26 +3276,30 @@ channels = "ALL"
 
     #[test]
     fn compose_session_title_falls_back_to_bare_agent_name_without_a_channel() {
+        crate::settings::init_for_tests();
         assert_eq!(compose_session_title("Fizz", None), "Fizz");
         assert_eq!(compose_session_title("Fizz", Some("   ")), "Fizz");
     }
 
     #[test]
     fn compose_session_title_truncates_the_channel_and_keeps_the_agent_name() {
+        crate::settings::init_for_tests();
         let channel = "c".repeat(200);
         let title = compose_session_title("Fizz", Some(&channel));
-        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert_eq!(title.chars().count(), title_max());
         assert!(title.starts_with("Fizz · #c"));
     }
 
     #[test]
     fn compose_session_title_drops_the_channel_when_the_agent_name_fills_the_cap() {
-        let agent = "a".repeat(SESSION_TITLE_MAX_CHARS);
+        crate::settings::init_for_tests();
+        let agent = "a".repeat(title_max());
         assert_eq!(compose_session_title(&agent, Some("buzz-dev")), agent);
     }
 
     #[test]
     fn scoped_session_title_keeps_short_root_even_when_names_fill_the_cap() {
+        crate::settings::init_for_tests();
         let root = "abcdef01".repeat(8);
         assert_eq!(
             compose_scoped_session_title("Fizz", Some("buzz-dev"), Some(&root)),
@@ -3174,7 +3318,7 @@ channels = "ALL"
             ("Fizz".into(), "🐝".repeat(100)),
         ] {
             let title = compose_scoped_session_title(&agent, Some(&channel), Some(&root));
-            assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+            assert_eq!(title.chars().count(), title_max());
             assert!(title.ends_with(" · abcdef01"));
         }
         assert_eq!(

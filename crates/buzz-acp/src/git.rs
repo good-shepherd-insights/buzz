@@ -30,7 +30,9 @@ impl GitEnvironment {
     ) -> anyhow::Result<Self> {
         let agent = GitIdentityMode::from_value(std::env::var_os(GIT_IDENTITY_ENV).as_deref())?
             == GitIdentityMode::Agent;
-        let dir = tempfile::Builder::new().prefix("buzz-acp-git-").tempdir()?;
+        let dir = tempfile::Builder::new()
+            .prefix(&crate::settings::get().git.tempdir_prefix)
+            .tempdir()?;
         set_owner_only(dir.path())?;
         symlink(executable, &dir.path().join("git-credential-nostr"))?;
         if agent {
@@ -120,7 +122,10 @@ fn inherited_config() -> anyhow::Result<Vec<(String, String)>> {
         Err(std::env::VarError::NotPresent) => 0,
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(count <= 1024, "too many inherited Git config entries");
+    anyhow::ensure!(
+        count <= crate::settings::get().git.git_config_count_cap,
+        "too many inherited Git config entries"
+    );
     (0..count)
         .map(|i| {
             Ok((
@@ -231,9 +236,6 @@ fn write_keyfile_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// chrome and may be composed (`Agent · #channel`) by consumers. Commits
 /// outlive sessions, so git attribution must not follow a mutable title.
 ///
-/// Max characters in a git author name. Nostr display names are unbounded.
-const MAX_GIT_USER_NAME_CHARS: usize = 80;
-
 /// Characters git's `ident.c` treats as "crud": stripped from both ends of a
 /// name, and — when a name is *nothing but* these — rejected outright with
 /// `fatal: name consists only of disallowed characters`.
@@ -294,7 +296,7 @@ fn is_unicode_format(c: char) -> bool {
 /// back to the npub.
 ///
 /// Strips control and Unicode format characters plus angle brackets, collapses
-/// whitespace runs, trims, and caps at [`MAX_GIT_USER_NAME_CHARS`] by `chars()`
+/// whitespace runs, trims, and caps at `[git] max_git_user_name_chars` by `chars()`
 /// so a multi-byte name cannot be split mid-UTF-8. Angle brackets go because git
 /// silently drops them rather than erroring — `Duncan <evil@x.com>` would
 /// render as `Duncan evil@x.com <hex@relay>`, which forges nothing but reads as
@@ -317,7 +319,7 @@ fn sanitize_git_user_name(raw: &str) -> Option<String> {
         .join(" ");
     let name: String = collapsed
         .chars()
-        .take(MAX_GIT_USER_NAME_CHARS)
+        .take(crate::settings::get().git.max_git_user_name_chars)
         .collect::<String>()
         .trim_end()
         .to_string();
@@ -331,11 +333,12 @@ fn identity_entries(
     relay: &str,
     display_name: Option<&str>,
 ) -> Vec<(String, String)> {
+    let git_settings = &crate::settings::get().git;
     let host = url::Url::parse(relay)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .filter(|host| !host.starts_with("localhost") && !host.starts_with("127."))
-        .unwrap_or_else(|| "buzz".into());
+        .unwrap_or_else(|| git_settings.email_fallback_host.clone());
     let mut entries = vec![
         (
             "user.name".into(),
@@ -343,7 +346,13 @@ fn identity_entries(
                 .and_then(sanitize_git_user_name)
                 .unwrap_or_else(|| info.npub.clone()),
         ),
-        ("user.email".into(), format!("{}@{host}", info.pubkey_hex)),
+        (
+            "user.email".into(),
+            crate::settings::render(
+                &git_settings.email_template,
+                &[("pubkey", &info.pubkey_hex), ("host", &host)],
+            ),
+        ),
     ];
     entries.extend([
         ("gpg.format".into(), "x509".into()),
@@ -422,11 +431,16 @@ fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod git_user_name_tests {
     use super::{
         build_git_env, identity_entries, is_git_crud, is_unicode_format, sanitize_git_user_name,
-        KeyInfo, MAX_GIT_USER_NAME_CHARS,
+        KeyInfo,
     };
 
     const PUBKEY_HEX: &str = "dcfd242e557282d7a1e2cf2e6877522682f1e5c6156dc92ca7d90eaedd3b0f95";
     const NPUB: &str = "npub1mn7jgtj4w2pd0g0zeuhxsa6jy6p0rewxz4kujt98my82ahfmp72sxjexk7";
+
+    fn max_name_chars() -> usize {
+        crate::settings::init_for_tests();
+        crate::settings::get().git.max_git_user_name_chars
+    }
 
     fn key_info() -> KeyInfo {
         KeyInfo {
@@ -437,6 +451,7 @@ mod git_user_name_tests {
     }
 
     fn git_env(display_name: Option<&str>) -> Vec<(String, String)> {
+        crate::settings::init_for_tests();
         let relay = "https://localhost:3000";
         build_git_env(
             relay,
@@ -460,11 +475,13 @@ mod git_user_name_tests {
 
     #[test]
     fn test_ordinary_name_passes_through_unchanged() {
+        crate::settings::init_for_tests();
         assert_eq!(sanitize_git_user_name("Duncan"), Some("Duncan".into()));
     }
 
     #[test]
     fn test_angle_brackets_are_stripped_so_no_second_email_is_rendered() {
+        crate::settings::init_for_tests();
         // git drops the brackets itself and renders `Duncan evil@x.com
         // <hex@relay>` — no forgery, but a confusing author line.
         assert_eq!(
@@ -475,6 +492,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_whitespace_control_characters_become_a_single_separator() {
+        crate::settings::init_for_tests();
         // Newline, tab and carriage return are whitespace: they collapse to one
         // space like any other run, so a multi-line name stays readable.
         assert_eq!(
@@ -485,6 +503,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_non_whitespace_control_characters_are_dropped_outright() {
+        crate::settings::init_for_tests();
         // NUL is the important one: an interior NUL makes `Command::env` fail
         // the entire spawn upstream, so it must never survive to git config.
         let got = sanitize_git_user_name("Idaho\0Blade\u{7}").expect("non-empty");
@@ -494,6 +513,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_internal_whitespace_runs_collapse_to_one_space() {
+        crate::settings::init_for_tests();
         assert_eq!(
             sanitize_git_user_name("  Duncan   Idaho  "),
             Some("Duncan Idaho".into())
@@ -502,16 +522,19 @@ mod git_user_name_tests {
 
     #[test]
     fn test_whitespace_only_name_falls_back_to_npub() {
+        crate::settings::init_for_tests();
         assert_eq!(sanitize_git_user_name("   \t\n  "), None);
     }
 
     #[test]
     fn test_empty_name_falls_back_to_npub() {
+        crate::settings::init_for_tests();
         assert_eq!(sanitize_git_user_name(""), None);
     }
 
     #[test]
     fn test_crud_only_name_falls_back_rather_than_aborting_every_commit() {
+        crate::settings::init_for_tests();
         // git rejects a name built only of crud with `fatal: name consists
         // only of disallowed characters`, which would break EVERY commit the
         // agent makes. Verified against git 2.54.0.
@@ -526,6 +549,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_crud_mixed_with_real_characters_is_kept() {
+        crate::settings::init_for_tests();
         // Legitimate names contain crud; only an all-crud result is fatal.
         assert_eq!(sanitize_git_user_name("O'Brien"), Some("O'Brien".into()));
         assert_eq!(
@@ -538,27 +562,28 @@ mod git_user_name_tests {
     fn test_over_length_name_is_truncated_to_the_cap() {
         let long = "a".repeat(200);
         let got = sanitize_git_user_name(&long).expect("non-empty");
-        assert_eq!(got.chars().count(), MAX_GIT_USER_NAME_CHARS);
+        assert_eq!(got.chars().count(), max_name_chars());
     }
 
     #[test]
     fn test_truncation_never_splits_a_multibyte_character() {
         let long = "🐝".repeat(200);
         let got = sanitize_git_user_name(&long).expect("non-empty");
-        assert_eq!(got.chars().count(), MAX_GIT_USER_NAME_CHARS);
+        assert_eq!(got.chars().count(), max_name_chars());
         assert!(got.chars().all(|c| c == '🐝'), "no replacement chars");
     }
 
     #[test]
     fn test_truncation_does_not_leave_a_trailing_space() {
         // Cutting mid-word would otherwise strand the separator at the end.
-        let raw = format!("{} tail", "a".repeat(MAX_GIT_USER_NAME_CHARS - 1));
+        let raw = format!("{} tail", "a".repeat(max_name_chars() - 1));
         let got = sanitize_git_user_name(&raw).expect("non-empty");
         assert!(!got.ends_with(' '), "got {got:?}");
     }
 
     #[test]
     fn test_non_ascii_names_survive() {
+        crate::settings::init_for_tests();
         assert_eq!(
             sanitize_git_user_name("Élodie 🐝"),
             Some("Élodie 🐝".into())
@@ -567,6 +592,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_format_only_name_falls_back_to_npub() {
+        crate::settings::init_for_tests();
         // U+200B is neither control, nor whitespace, nor crud, so before Cf
         // filtering this passed the non-crud gate and handed git a visually
         // blank author instead of falling back.
@@ -583,6 +609,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_bidi_override_is_stripped_and_the_name_is_kept() {
+        crate::settings::init_for_tests();
         // A trailing RLO would reorder everything after it in `git log`, so the
         // mark goes and the readable name stays.
         assert_eq!(
@@ -597,6 +624,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_zero_width_space_inside_a_word_is_removed_without_splitting_it() {
+        crate::settings::init_for_tests();
         // U+200B is not whitespace, so it must not become a separator: the word
         // rejoins rather than turning into "Dun can".
         assert_eq!(
@@ -611,7 +639,7 @@ mod git_user_name_tests {
         // shorten the visible name.
         let raw = format!("{}{}", "\u{200B}".repeat(200), "a".repeat(90));
         let got = sanitize_git_user_name(&raw).expect("non-empty");
-        assert_eq!(got.chars().count(), MAX_GIT_USER_NAME_CHARS);
+        assert_eq!(got.chars().count(), max_name_chars());
         assert!(got.chars().all(|c| c == 'a'), "got {got:?}");
     }
 
@@ -690,6 +718,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_build_git_env_uses_display_name_and_leaves_email_on_the_pubkey() {
+        crate::settings::init_for_tests();
         let env = git_env(Some("Duncan"));
 
         assert_eq!(git_config(&env, "user.name").as_deref(), Some("Duncan"));
@@ -707,6 +736,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_build_git_env_falls_back_to_npub_when_display_name_unset() {
+        crate::settings::init_for_tests();
         let env = git_env(None);
 
         // Without a display name, attribution falls back to the npub.
@@ -719,6 +749,7 @@ mod git_user_name_tests {
 
     #[test]
     fn test_build_git_env_falls_back_to_npub_when_display_name_is_unusable() {
+        crate::settings::init_for_tests();
         // Crud-only and format-only names both reach git as the npub — one
         // would abort every commit, the other would render as blank.
         for raw in ["<>", "\u{200B}"] {

@@ -8,17 +8,11 @@
 //! so the queue carries the routing with the event and no later stage needs a
 //! network lookup.
 
-use std::time::Duration;
-
 use nostr::{Alphabet, Event, EventId, Filter, Kind, SingleLetterTag};
 use uuid::Uuid;
 
 use crate::queue::{edit_target_id, parse_thread_tags, ResolvedEdit};
 use crate::relay::{RelayError, RestClient};
-
-/// Bound for the single original-event lookup. Matches the other bounded
-/// admission lookups on the listener loop (see `check_sibling_via_profile`).
-const EDIT_ORIGINAL_FETCH_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 /// Resolve the original message targeted by `event` if it is an edit.
 ///
@@ -58,8 +52,13 @@ where
         ])
         .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()])
         .limit(1);
-    let response = match tokio::time::timeout(EDIT_ORIGINAL_FETCH_TIMEOUT, query(vec![filter]))
-        .await
+    let response = match tokio::time::timeout(
+        crate::settings::get()
+            .edit_routing
+            .original_fetch_timeout_ms,
+        query(vec![filter]),
+    )
+    .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -133,6 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_threaded_original_with_scoped_filter() {
+        crate::settings::init_for_tests();
         let root = "aa".repeat(32);
         let original = message(Some(&root));
         let edit = edit_event(&original.id.to_hex(), &[]);
@@ -156,6 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_a_returned_event_that_is_not_the_target() {
+        crate::settings::init_for_tests();
         let target = message(None);
         let impostor = message(None);
         let edit = edit_event(&target.id.to_hex(), &[]);
@@ -171,6 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_events_are_not_resolved() {
+        crate::settings::init_for_tests();
         let resolved = resolve_edit_with(&message(None), Uuid::new_v4(), |_| async {
             panic!("ordinary events must not query the relay")
         })

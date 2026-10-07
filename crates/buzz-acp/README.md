@@ -7,6 +7,56 @@ For one prepared local task, use **`buzz-acp run --task <path|->`**. See
 
 ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
 
+A task is named by the agent, then created. The full contract is [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md).
+
+```mermaid
+sequenceDiagram
+    participant Channel
+    participant Bridge
+    participant Fastino
+    participant Claude
+    participant Multica
+
+    Channel->>Bridge: mention
+    Bridge->>Fastino: message text
+    Fastino-->>Bridge: ask or work
+
+    alt ask
+        Bridge->>Channel: answer
+    else work
+        Bridge->>Claude: message + name prompt
+        Claude-->>Bridge: title, description
+        Bridge->>Multica: create issue(title, description)
+        Multica-->>Bridge: issue key, url
+        Bridge->>Channel: link, ticket reaction
+        Bridge->>Claude: phase todo
+        Claude-->>Bridge: work
+        loop status unchanged and gate continues
+            Bridge->>Claude: same phase task
+            Claude-->>Bridge: work
+            Bridge->>Multica: read status
+        end
+        Bridge->>Claude: task for the new status
+    end
+```
+
+```text
+intake(message)
+  kind = classify(message)          # Fastino: ask | work
+  if kind == ask: queue answer
+  if kind == work:
+      draft = agent.write(message, name_prompt)
+      require draft.title and draft.description
+      issue = multica.create(draft.title, draft.description)
+      link(issue, channel, root, event)   # post_placement: thread or channel
+      react(ticket)
+      agent.work(phase(todo))
+      while status is unchanged and gate(status) continues:
+          agent.work(phase(status))
+          status = multica.status(issue)
+      agent.work(phase(new status))     # in_review, blocked, and done once
+```
+
 ```
 Buzz Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
                                                │

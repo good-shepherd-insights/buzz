@@ -24,12 +24,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-/// Default capacity of the event channel from background task to harness.
-/// Override with `BUZZ_ACP_EVENT_BUFFER` env var at startup.
-const EVENT_CHANNEL_CAPACITY_DEFAULT: usize = 256;
-/// Capacity of the command channel from harness to background task.
-const CMD_CHANNEL_CAPACITY: usize = 64;
-
 /// Read the event channel capacity from the environment, falling back to the
 /// compiled-in default. Parsed once at call-site (connect time).
 fn event_channel_capacity() -> usize {
@@ -37,82 +31,8 @@ fn event_channel_capacity() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.max(1)) // mpsc::channel panics on capacity 0
-        .unwrap_or(EVENT_CHANNEL_CAPACITY_DEFAULT)
+        .unwrap_or(crate::settings::get().relay.event_channel_capacity_default)
 }
-/// Maximum number of seen event IDs before the dedup set is rotated.
-/// Two-generation dedup: each generation holds up to SEEN_ID_LIMIT/2 entries.
-const SEEN_ID_LIMIT: usize = 12_000;
-
-/// Interval between client-initiated WebSocket pings.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
-/// If no pong is received within this duration after a ping, the connection is
-/// considered dead and the background task triggers a reconnect.
-const PONG_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout for individual ws.send() calls. Prevents a stalled socket from
-/// wedging the background task indefinitely.
-const WS_SEND_TIMEOUT_SECS: u64 = 10;
-/// Diagnostic threshold: log when a connection has been stable for this long.
-/// The stability block resets `BgState::backoff_step` to 0 here so the next
-/// drop after a long healthy run retries at the short end of the ladder again.
-const STABLE_CONNECTION_SECS: u64 = 60;
-/// Seconds subtracted from `since` on resubscribe to tolerate clock skew.
-const SINCE_SKEW_SECS: u64 = 5;
-/// Timeout for the NIP-42 auth handshake steps.
-///
-/// Raised from 5s to 20s (≈2 RTTs at the observed 10s max round-trip on degraded
-/// links) so auth doesn't time out before the first WS frame arrives.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
-/// Timeout for the TCP + WebSocket handshake in `do_connect`.
-///
-/// Raised from 10s to 30s so the OS TCP connect attempt (SYN→SYN-ACK) has time
-/// to succeed at 3.4s average / 10s max observed RTT.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Backoff delay values shared by the initial-connect retry in
-/// `HarnessRelay::connect()` and `try_autonomous_reconnect`'s post-start
-/// reconnect loop — a spotty link should get consistent retry pacing whether
-/// the failure happens at agent startup or later. Bounded so a dead relay
-/// can't hang either path forever.
-///
-/// The two callers consume this differently: `retry_initial_connect` sleeps
-/// before every entry (1 immediate attempt + up to 5 delayed retries, all 5
-/// values used), while `try_autonomous_reconnect` skips the sleep after its
-/// final attempt (5 attempts total, only the first 4 values used) — so
-/// "shared values," not "identical schedule."
-const STARTUP_CONNECT_BACKOFFS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-];
-/// Flat retry interval for DNS failures — no backoff ladder rung consumed.
-/// 2s gives name servers a short window to recover from a brownout without driving
-/// a tight storm; jitter (±20%) staggers concurrent agent instances.
-///
-/// DNS flat retries are capped at 10 in the bounded startup/reconnect path
-/// (`try_autonomous_reconnect`) so a full brownout cannot hang agent startup
-/// indefinitely. In `wait_for_reconnect` the DNS path is unbounded — a
-/// reconnecting agent should keep trying across extended outages rather than
-/// give up.
-const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-/// Minimum inter-REQ spacing during resubscribe bursts.
-/// 125 ms ≈ 8 frames/s — safely below the relay's 50-frames-per-5s admission
-/// window (10 frames/s at the limit). A 48-channel reconnect spreads over ≈6 s
-/// instead of arriving as a single burst that consumes the entire budget at once.
-const REQ_PACING_INTERVAL: Duration = Duration::from_millis(125);
-/// Maximum REQ frames sent per drain iteration (shared across rate_limited_pending,
-/// resubscribe_retry, and control-sub recovery). Keeps any single main-loop tick
-/// below the relay's 50-frames/5s budget, and ensures the select! loop is never
-/// blocked for more than one REQ's worth of I/O between drain ticks.
-const DRAIN_BUDGET_PER_ITER: usize = 1;
-/// Maximum observer telemetry frames parked while the rate-limit gate is armed
-/// (or the socket is down). The upstream publisher ships at most ONE batched
-/// frame per second GLOBALLY (one publish slot per tick, regardless of how
-/// many channels are active), so this covers ~4 minutes of gating; beyond that
-/// the oldest frames are dropped with visible accounting
-/// (`gated_observer_dropped`). Note each dropped frame may carry a whole batch
-/// of events, so event-level loss is larger than the frame count.
-const GATED_OBSERVER_QUEUE_CAP: usize = 256;
 
 use std::time::Instant;
 
@@ -258,16 +178,11 @@ pub struct RestClient {
 
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+    crate::settings::get()
+        .relay
+        .rest_retryable_statuses
+        .contains(&status.as_u16())
 }
-
-/// Base retry delays for transient HTTP failures: 500ms, 1s, 2s.
-/// Jitter (±20%) is applied at call time via `jittered_duration`.
-const REST_RETRY_BASE_DELAYS: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_millis(1000),
-    Duration::from_millis(2000),
-];
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -288,7 +203,7 @@ impl RestClient {
         let mut failures = Vec::new();
         let mut saw_document_without_self = false;
 
-        for path in ["/", "/info"] {
+        for path in &crate::settings::get().relay.nip11_paths {
             let url = format!("{}{path}", self.base_url);
             let response = match self
                 .http
@@ -411,7 +326,13 @@ impl RestClient {
         let mut last_err = None;
 
         for (attempt, delay) in std::iter::once(None)
-            .chain(REST_RETRY_BASE_DELAYS.iter().map(|d| Some(*d)))
+            .chain(
+                crate::settings::get()
+                    .relay
+                    .rest_retry_base_delays_ms
+                    .iter()
+                    .map(|d| Some(*d)),
+            )
             .enumerate()
         {
             if let Some(base) = delay {
@@ -510,21 +431,21 @@ impl RestClient {
     /// Uses the bridge's composite `(until, before_id)` cursor so a full page
     /// never becomes evidence that older project metadata is absent.
     pub async fn query_raw_all(&self, mut filter: Value) -> Result<Vec<Value>, RelayError> {
-        const PAGE_SIZE: usize = 500;
-        const EVENT_BOUND: usize = 10_000;
+        let page_size = crate::settings::get().relay.query_page_size;
+        let event_bound = crate::settings::get().relay.query_event_bound;
         let mut events = Vec::new();
         loop {
-            let remaining_probe = EVENT_BOUND + 1 - events.len();
-            let page_limit = PAGE_SIZE.min(remaining_probe);
+            let remaining_probe = event_bound + 1 - events.len();
+            let page_limit = page_size.min(remaining_probe);
             filter["limit"] = serde_json::json!(page_limit);
             let page = self.query_raw(std::slice::from_ref(&filter)).await?;
             let page = page
                 .as_array()
                 .ok_or_else(|| RelayError::Http("query response is not an array".into()))?;
             let done = page.len() < page_limit;
-            if events.len() + page.len() > EVENT_BOUND {
+            if events.len() + page.len() > event_bound {
                 return Err(RelayError::Http(format!(
-                    "query exceeded the exhaustive {EVENT_BOUND}-event bound"
+                    "query exceeded the exhaustive {event_bound}-event bound"
                 )));
             }
             if !done {
@@ -772,7 +693,8 @@ impl HarnessRelay {
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
             mpsc::channel::<Event>(event_channel_capacity());
-        let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCommand>(CMD_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) =
+            mpsc::channel::<RelayCommand>(crate::settings::get().relay.cmd_channel_capacity);
 
         let bg_keys = keys.clone();
         let bg_relay_url = relay_url.to_string();
@@ -799,8 +721,8 @@ impl HarnessRelay {
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(crate::settings::get().relay.rest_timeout_secs)
+                .connect_timeout(crate::settings::get().relay.rest_connect_timeout_secs)
                 .build()
                 .map_err(|e| RelayError::Http(format!("failed to build HTTP client: {e}")))?,
             relay_url: relay_url.to_string(),
@@ -1063,7 +985,7 @@ impl HarnessRelay {
         let _ = self.cmd_tx.send(RelayCommand::Shutdown).await;
         if let Some(handle) = self.bg_handle.take() {
             let abort_handle = handle.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(5), handle)
+            if tokio::time::timeout(crate::settings::get().relay.shutdown_join_secs, handle)
                 .await
                 .is_err()
             {
@@ -1182,7 +1104,7 @@ struct BgState {
     /// Channels parked because a CLOSED "rate-limited:" was received.
     ///
     /// Drained by the main loop when the gate clears, one REQ per
-    /// `REQ_PACING_INTERVAL` tick via the select-integrated pacing timer.
+    /// `req_pacing_interval_ms` tick via the select-integrated pacing timer.
     /// Value is the `Instant` before which the channel must not be retried.
     rate_limited_pending: HashMap<Uuid, tokio::time::Instant>,
     /// Set when a rate-limited CLOSED arrives for the membership notification
@@ -1196,7 +1118,7 @@ struct BgState {
     /// Observer telemetry frames (kind 24200) parked while the rate-limit gate
     /// is armed. Unlike typing indicators, these frames are durable telemetry:
     /// dropping them silently loses turn history in the Desktop observer.
-    /// Bounded at `GATED_OBSERVER_QUEUE_CAP` (drop-oldest); drained by the
+    /// Bounded at `gated_observer_queue_cap` (drop-oldest); drained by the
     /// main loop one frame per pacing tick once the gate clears.
     gated_observer_pending: VecDeque<Box<Event>>,
     /// Observer frames written to the socket but not yet acknowledged. The
@@ -1219,7 +1141,7 @@ struct BgState {
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
     /// the elevated rung it earned. Reset to 0 by the stability block once the
-    /// connection has been up for `STABLE_CONNECTION_SECS`.
+    /// connection has been up for `stable_connection_secs`.
     backoff_step: usize,
 }
 
@@ -1228,7 +1150,7 @@ impl BgState {
         Self {
             active_subscriptions: HashMap::new(),
             last_seen: HashMap::new(),
-            seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
+            seen_ids: TwoGenDedup::new(crate::settings::get().relay.seen_id_limit),
             active_filters: HashMap::new(),
             membership_dropped_since: None,
             membership_last_seen: None,
@@ -1322,7 +1244,12 @@ impl BgState {
     ///
     /// Returns the gate deadline that was set.
     fn set_rate_limit_gate(&mut self, retry_secs: u64) -> tokio::time::Instant {
-        let secs = if retry_secs < 2 { 5 } else { retry_secs };
+        let relay = &crate::settings::get().relay;
+        let secs = if retry_secs < relay.rate_limit_threshold_secs.as_secs() {
+            relay.rate_limit_fallback_secs.as_secs()
+        } else {
+            retry_secs
+        };
         let base = Duration::from_secs(secs);
         let deadline = tokio::time::Instant::now() + jittered_duration(base);
         let gate = match self.rate_limit_gate {
@@ -1353,7 +1280,9 @@ impl BgState {
     /// Bounded drop-oldest queue: overflow evicts the oldest frame and counts
     /// it in `gated_observer_dropped` so the loss is visible, never silent.
     fn park_gated_observer_frame(&mut self, event: Box<Event>) {
-        if self.gated_observer_pending.len() >= GATED_OBSERVER_QUEUE_CAP {
+        if self.gated_observer_pending.len()
+            >= crate::settings::get().relay.gated_observer_queue_cap
+        {
             self.gated_observer_pending.pop_front();
             self.gated_observer_dropped += 1;
             warn!(
@@ -1391,7 +1320,9 @@ impl BgState {
             return;
         };
         if let Some(event) = self.observer_in_flight.remove(index) {
-            if self.gated_observer_pending.len() >= GATED_OBSERVER_QUEUE_CAP {
+            if self.gated_observer_pending.len()
+                >= crate::settings::get().relay.gated_observer_queue_cap
+            {
                 self.gated_observer_pending.pop_front();
                 self.gated_observer_dropped += 1;
                 warn!(
@@ -1405,14 +1336,16 @@ impl BgState {
 
     /// Enforce the parked-queue bound, counting evictions so loss stays visible.
     fn trim_gated_observer_pending(&mut self) {
-        while self.gated_observer_pending.len() > GATED_OBSERVER_QUEUE_CAP {
+        while self.gated_observer_pending.len()
+            > crate::settings::get().relay.gated_observer_queue_cap
+        {
             self.gated_observer_pending.pop_front();
             self.gated_observer_dropped += 1;
         }
     }
 
     fn track_observer_in_flight(&mut self, event: Box<Event>) {
-        if self.observer_in_flight.len() >= GATED_OBSERVER_QUEUE_CAP {
+        if self.observer_in_flight.len() >= crate::settings::get().relay.gated_observer_queue_cap {
             self.observer_in_flight.pop_front();
             self.gated_observer_dropped += 1;
             warn!(
@@ -1620,8 +1553,7 @@ async fn execute_connected_command(
                 if let Ok(text) = serde_json::to_string(&msg) {
                     // Best-effort CLOSE — don't fail the command if send fails,
                     // because the intent (unsubscribe) is already applied to state.
-                    let _ =
-                        ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await;
+                    let _ = ws_send_timeout(ws, Message::Text(text.into())).await;
                 }
                 debug!("unsubscribed from channel {channel_id}");
             }
@@ -1811,7 +1743,7 @@ async fn run_background_task(
     }
 
     // Client-initiated ping to detect silent connection death.
-    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    let mut ping_interval = tokio::time::interval(crate::settings::get().relay.ping_interval_secs);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_pong = Instant::now();
     let mut ping_sent = false;
@@ -1831,7 +1763,7 @@ async fn run_background_task(
         // admission window.
         let drain_window_open = drain_pacing_next.is_none_or(|t| tokio::time::Instant::now() >= t);
         if drain_window_open {
-            let mut budget = DRAIN_BUDGET_PER_ITER;
+            let mut budget = crate::settings::get().relay.drain_budget_per_iter;
             let mut any_sent = false;
 
             // Control subs use a flag rather than a per-channel pending entry, so
@@ -1896,14 +1828,20 @@ async fn run_background_task(
             }
 
             if any_sent {
-                drain_pacing_next = Some(tokio::time::Instant::now() + REQ_PACING_INTERVAL);
+                drain_pacing_next = Some(
+                    tokio::time::Instant::now()
+                        + crate::settings::get().relay.req_pacing_interval_ms,
+                );
             } else if !state.gated_observer_pending.is_empty() {
                 // Nothing sent because the gate is still armed. Arm the pacing
                 // timer to the gate deadline so parked observer frames drain
                 // promptly even when no other traffic wakes the select loop.
-                drain_pacing_next = state
-                    .check_rate_gate()
-                    .or_else(|| Some(tokio::time::Instant::now() + REQ_PACING_INTERVAL));
+                drain_pacing_next = state.check_rate_gate().or_else(|| {
+                    Some(
+                        tokio::time::Instant::now()
+                            + crate::settings::get().relay.req_pacing_interval_ms,
+                    )
+                });
             }
         }
 
@@ -2014,7 +1952,6 @@ async fn run_background_task(
                                let _ = ws_send_timeout(
                                    &mut ws,
                                    Message::Close(None),
-                                   WS_SEND_TIMEOUT_SECS,
                                )
                                .await;
                                return;
@@ -2065,9 +2002,9 @@ async fn run_background_task(
                    }
 
                    _ = ping_interval.tick() => {
-                       if ping_sent && last_pong.elapsed() > PONG_TIMEOUT {
+                       if ping_sent && last_pong.elapsed() > crate::settings::get().relay.pong_timeout_secs {
                            // No pong received after our last ping — connection is dead.
-                           warn!("no pong received within {:?} — connection dead, reconnecting", PONG_TIMEOUT);
+                           warn!("no pong received within {:?} — connection dead, reconnecting", crate::settings::get().relay.pong_timeout_secs);
                            // Use try_send to avoid blocking on backpressure during recovery.
                            let _ = event_tx.try_send(None);
                            match try_autonomous_reconnect(
@@ -2099,7 +2036,7 @@ async fn run_background_task(
                            connected_since = Instant::now();
                            stable_logged = false;
                        } else if !ping_sent {
-                           if let Err(e) = ws_send_timeout(&mut ws, Message::Ping(vec![].into()), WS_SEND_TIMEOUT_SECS).await {
+                           if let Err(e) = ws_send_timeout(&mut ws, Message::Ping(vec![].into())).await {
                                warn!("failed to send ping: {e} — triggering reconnect");
                                // Use try_send to avoid blocking on backpressure during recovery.
                                let _ = event_tx.try_send(None);
@@ -2153,13 +2090,17 @@ async fn run_background_task(
 
         // Reset backoff_step on a long healthy run so a subsequent brief drop
         // retries at the short end of the backoff ladder.
-        if !stable_logged && connected_since.elapsed() > Duration::from_secs(STABLE_CONNECTION_SECS)
+        if !stable_logged
+            && connected_since.elapsed() > crate::settings::get().relay.stable_connection_secs
         {
             stable_logged = true;
             state.backoff_step = 0;
             debug!(
                 "connection stable for >{}s — backoff ladder reset",
-                STABLE_CONNECTION_SECS
+                crate::settings::get()
+                    .relay
+                    .stable_connection_secs
+                    .as_secs()
             );
         }
     }
@@ -2266,7 +2207,9 @@ async fn handle_ws_message(
                         };
                         let cap = event_tx.max_capacity();
                         let used = cap - event_tx.capacity();
-                        if used >= (cap * 4 / 5) {
+                        if used
+                            >= (cap * crate::settings::get().relay.backpressure_warn_percent / 100)
+                        {
                             warn!(
                                 used,
                                 capacity = cap,
@@ -2307,7 +2250,10 @@ async fn handle_ws_message(
                             // Warn at 80% capacity.
                             let cap = event_tx.max_capacity();
                             let used = cap - event_tx.capacity();
-                            if used >= (cap * 4 / 5) {
+                            if used
+                                >= (cap * crate::settings::get().relay.backpressure_warn_percent
+                                    / 100)
+                            {
                                 warn!(
                                     used,
                                     capacity = cap,
@@ -2548,7 +2494,7 @@ async fn handle_ws_message(
             true
         }
         Message::Ping(data) => {
-            if let Err(e) = ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS).await {
+            if let Err(e) = ws_send_timeout(ws, Message::Pong(data)).await {
                 warn!("failed to send pong: {e}");
                 return false;
             }
@@ -2649,7 +2595,7 @@ enum ResubscribeResult {
 /// successful reconnect. Computes `since = min(last_seen, channel_dropped_since)`
 /// per channel, and only clears the drop tracker when the REQ is confirmed sent.
 ///
-/// Paces REQs at `REQ_PACING_INTERVAL` (125 ms) via a shutdown-aware sleep so
+/// Paces REQs at `req_pacing_interval_ms` via a shutdown-aware sleep so
 /// a 48-channel reconnect burst spreads over ≈6 s. Commands received during a
 /// pacing sleep are deferred in arrival order and executed on the live socket
 /// after replay. If the gate is active mid-burst, remaining channels are parked
@@ -2715,7 +2661,13 @@ async fn resubscribe_after_reconnect(
             if this_sent {
                 state.channel_dropped_since.remove(&channel_id);
                 // Shutdown-aware pacing sleep before any next replay/deferred REQ.
-                if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
+                if !pacing_sleep(
+                    cmd_rx,
+                    &mut deferred_commands,
+                    crate::settings::get().relay.req_pacing_interval_ms,
+                )
+                .await
+                {
                     return ResubscribeResult::Shutdown;
                 }
             } else {
@@ -2738,7 +2690,12 @@ async fn resubscribe_after_reconnect(
             state.membership_resub_needed = true;
         } else {
             if !state.active_subscriptions.is_empty()
-                && !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await
+                && !pacing_sleep(
+                    cmd_rx,
+                    &mut deferred_commands,
+                    crate::settings::get().relay.req_pacing_interval_ms,
+                )
+                .await
             {
                 return ResubscribeResult::Shutdown;
             }
@@ -2765,7 +2722,13 @@ async fn resubscribe_after_reconnect(
             debug!("rate-gated: parking observer control resubscribe after reconnect");
             state.observer_resub_needed = true;
         } else {
-            if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
+            if !pacing_sleep(
+                cmd_rx,
+                &mut deferred_commands,
+                crate::settings::get().relay.req_pacing_interval_ms,
+            )
+            .await
+            {
                 return ResubscribeResult::Shutdown;
             }
             if !send_observer_control_subscribe(ws, agent_pubkey_hex).await {
@@ -2791,8 +2754,7 @@ async fn resubscribe_after_reconnect(
 async fn send_publish_event_frame(ws: &mut WsStream, event: &Event) -> bool {
     let msg = json!(["EVENT", event]);
     if let Ok(text) = serde_json::to_string(&msg) {
-        if let Err(e) = ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await
-        {
+        if let Err(e) = ws_send_timeout(ws, Message::Text(text.into())).await {
             warn!("failed to publish event: {e}");
             return false;
         }
@@ -2890,7 +2852,8 @@ async fn drain_rate_limited_pending(
         } else {
             // Socket may be dead — re-queue with +5s penalty; the next ws event
             // will detect the dead socket and trigger a full reconnect.
-            let penalty = tokio::time::Instant::now() + Duration::from_secs(5);
+            let penalty =
+                tokio::time::Instant::now() + crate::settings::get().relay.req_retry_penalty_secs;
             state.rate_limited_pending.insert(channel_id, penalty);
             warn!("drain_rate_limited_pending: REQ failed for channel {channel_id} — re-queued with +5s penalty");
         }
@@ -2993,7 +2956,7 @@ async fn drain_commands(
         if send_failed {
             match cmd {
                 RelayCommand::Shutdown => {
-                    let _ = ws_send_timeout(ws, Message::Close(None), WS_SEND_TIMEOUT_SECS).await;
+                    let _ = ws_send_timeout(ws, Message::Close(None)).await;
                     return ReconnectOutcome::Shutdown;
                 }
                 RelayCommand::Reconnect => {}
@@ -3008,7 +2971,7 @@ async fn drain_commands(
             }
             RelayCommand::Shutdown => {
                 debug!("shutdown received during post-reconnect drain");
-                let _ = ws_send_timeout(ws, Message::Close(None), WS_SEND_TIMEOUT_SECS).await;
+                let _ = ws_send_timeout(ws, Message::Close(None)).await;
                 return ReconnectOutcome::Shutdown;
             }
             RelayCommand::Subscribe { .. }
@@ -3023,7 +2986,12 @@ async fn drain_commands(
                 }
                 if !send_failed
                     && pace_after
-                    && !pacing_sleep(cmd_rx, deferred_commands, REQ_PACING_INTERVAL).await
+                    && !pacing_sleep(
+                        cmd_rx,
+                        deferred_commands,
+                        crate::settings::get().relay.req_pacing_interval_ms,
+                    )
+                    .await
                 {
                     return ReconnectOutcome::Shutdown;
                 }
@@ -3083,15 +3051,14 @@ async fn try_autonomous_reconnect(
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
     // 5 attempts, up to 16s base backoff. Shares delay values with the
-    // initial-connect retry in `HarnessRelay::connect()` (STARTUP_CONNECT_BACKOFFS) —
+    // initial-connect retry in `HarnessRelay::connect()` (`startup_connect_backoffs_secs`) —
     // see its doc comment for how the two loops consume the array differently.
-    // DNS failures sleep flat (DNS_RETRY_INTERVAL) without consuming a ladder
+    // DNS failures sleep flat (`dns_retry_interval_secs`) without consuming a ladder
     // rung. Capped at 10 DNS-only retries in this bounded startup path so a
     // total brownout cannot hang agent startup indefinitely. By contrast,
     // `wait_for_reconnect` (the post-startup loop) retries DNS failures without
     // a cap — a reconnecting agent should keep trying across extended outages.
-    let backoffs = STARTUP_CONNECT_BACKOFFS;
-    const MAX_DNS_FLAT_RETRIES: usize = 10;
+    let backoffs = &crate::settings::get().relay.startup_connect_backoffs_secs;
     let mut dns_retry_count = 0usize;
 
     let mut attempt = 0usize;
@@ -3141,15 +3108,27 @@ async fn try_autonomous_reconnect(
             }
             // DNS failures retry flat without consuming a ladder rung.
             // Cap at MAX_DNS_FLAT_RETRIES so a total brownout doesn't hang startup.
-            Err(e) if is_dns_error(&e) && dns_retry_count < MAX_DNS_FLAT_RETRIES => {
+            Err(e)
+                if is_dns_error(&e)
+                    && dns_retry_count < crate::settings::get().relay.max_dns_flat_retries =>
+            {
                 dns_retry_count += 1;
                 warn!(
                     "autonomous reconnect DNS failure ({}/{}), flat retry in {:.1}s: {e}",
                     dns_retry_count,
-                    MAX_DNS_FLAT_RETRIES,
-                    DNS_RETRY_INTERVAL.as_secs_f64()
+                    crate::settings::get().relay.max_dns_flat_retries,
+                    crate::settings::get()
+                        .relay
+                        .dns_retry_interval_secs
+                        .as_secs_f64()
                 );
-                if !dns_flat_sleep(cmd_rx, state, DNS_RETRY_INTERVAL).await {
+                if !dns_flat_sleep(
+                    cmd_rx,
+                    state,
+                    crate::settings::get().relay.dns_retry_interval_secs,
+                )
+                .await
+                {
                     return ReconnectOutcome::Shutdown;
                 }
                 continue; // retry WITHOUT incrementing attempt
@@ -3229,14 +3208,7 @@ async fn wait_for_reconnect(
     // honoured during sleep. Resumes from state.backoff_step so a flapping link
     // keeps its elevated position; the stability block resets it to 0 after 60s.
     // DNS failures retry flat without consuming a ladder rung.
-    let backoffs = [
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-        Duration::from_secs(4),
-        Duration::from_secs(8),
-        Duration::from_secs(16),
-        Duration::from_secs(32),
-    ];
+    let backoffs = &crate::settings::get().relay.reconnect_backoffs_secs;
     let mut attempt = state.backoff_step;
     loop {
         info!("attempting relay reconnect to {relay_url}…");
@@ -3286,7 +3258,13 @@ async fn wait_for_reconnect(
             // so a reconnecting agent keeps trying across extended DNS brownouts.
             Err(e) if is_dns_error(&e) => {
                 warn!("relay reconnect DNS failure (not consuming ladder rung): {e}");
-                if !dns_flat_sleep(cmd_rx, state, DNS_RETRY_INTERVAL).await {
+                if !dns_flat_sleep(
+                    cmd_rx,
+                    state,
+                    crate::settings::get().relay.dns_retry_interval_secs,
+                )
+                .await
+                {
                     return ReconnectOutcome::Shutdown;
                 }
                 continue; // retry without incrementing attempt
@@ -3308,7 +3286,7 @@ async fn wait_for_reconnect(
         let delay = if attempt < backoffs.len() {
             backoffs[attempt]
         } else {
-            Duration::from_secs(60)
+            crate::settings::get().relay.reconnect_max_delay_secs
         };
         let jittered = jittered_duration(delay);
         warn!("retrying reconnect in {:.1}s", jittered.as_secs_f64());
@@ -3336,7 +3314,7 @@ async fn wait_for_reconnect(
 /// - `#p` is included only when `filter.require_mention` is `true`.
 /// - `#h` is always included (channel-scoped subscription).
 /// - On first subscribe (`since` is `None`) adds `since=now` to avoid replaying
-///   history. On reconnect (`since` is `Some`) subtracts [`SINCE_SKEW_SECS`].
+///   history. On reconnect (`since` is `Some`) subtracts `since_skew_secs`.
 ///
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
@@ -3367,7 +3345,7 @@ async fn send_subscribe(
     // since — on first subscribe use current time to skip history; on reconnect
     // subtract skew buffer to catch events missed during the disconnect window.
     let since_ts = match since {
-        Some(ts) => ts.saturating_sub(SINCE_SKEW_SECS),
+        Some(ts) => ts.saturating_sub(crate::settings::get().relay.since_skew_secs.as_secs()),
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3378,25 +3356,23 @@ async fn send_subscribe(
     let req = json!(["REQ", sub_id, Value::Object(req_filter)]);
 
     match serde_json::to_string(&req) {
-        Ok(text) => {
-            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
-                Ok(()) => {
-                    debug!(
-                        "subscribed to channel {channel_id}{}",
-                        if since.is_some() {
-                            " (with since filter)"
-                        } else {
-                            " (since=now)"
-                        }
-                    );
-                    true
-                }
-                Err(e) => {
-                    warn!("failed to send REQ for channel {channel_id}: {e}");
-                    false
-                }
+        Ok(text) => match ws_send_timeout(ws, Message::Text(text.into())).await {
+            Ok(()) => {
+                debug!(
+                    "subscribed to channel {channel_id}{}",
+                    if since.is_some() {
+                        " (with since filter)"
+                    } else {
+                        " (since=now)"
+                    }
+                );
+                true
             }
-        }
+            Err(e) => {
+                warn!("failed to send REQ for channel {channel_id}: {e}");
+                false
+            }
+        },
         Err(e) => {
             warn!("failed to serialize REQ for channel {channel_id}: {e}");
             false
@@ -3422,7 +3398,7 @@ async fn send_membership_subscribe(
     req_filter.insert("#p".into(), json!([agent_pubkey_hex]));
 
     let since_ts = match since {
-        Some(ts) => ts.saturating_sub(SINCE_SKEW_SECS),
+        Some(ts) => ts.saturating_sub(crate::settings::get().relay.since_skew_secs.as_secs()),
         None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3432,18 +3408,16 @@ async fn send_membership_subscribe(
 
     let req = json!(["REQ", MEMBERSHIP_NOTIF_SUB_ID, Value::Object(req_filter)]);
     match serde_json::to_string(&req) {
-        Ok(text) => {
-            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
-                Ok(()) => {
-                    debug!("subscribed to membership notifications (since={since_ts})");
-                    true
-                }
-                Err(e) => {
-                    warn!("failed to send membership notification REQ: {e}");
-                    false
-                }
+        Ok(text) => match ws_send_timeout(ws, Message::Text(text.into())).await {
+            Ok(()) => {
+                debug!("subscribed to membership notifications (since={since_ts})");
+                true
             }
-        }
+            Err(e) => {
+                warn!("failed to send membership notification REQ: {e}");
+                false
+            }
+        },
         Err(e) => {
             warn!("failed to serialize membership notification REQ: {e}");
             false
@@ -3467,18 +3441,16 @@ async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &s
     ]);
 
     match serde_json::to_string(&req) {
-        Ok(text) => {
-            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
-                Ok(()) => {
-                    debug!("subscribed to observer control frames");
-                    true
-                }
-                Err(e) => {
-                    warn!("failed to send observer control REQ: {e}");
-                    false
-                }
+        Ok(text) => match ws_send_timeout(ws, Message::Text(text.into())).await {
+            Ok(()) => {
+                debug!("subscribed to observer control frames");
+                true
             }
-        }
+            Err(e) => {
+                warn!("failed to send observer control REQ: {e}");
+                false
+            }
+        },
         Err(e) => {
             warn!("failed to serialize observer control REQ: {e}");
             false
@@ -3491,15 +3463,14 @@ async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &s
 /// All `ws.send()` calls go through here so a stalled TCP socket can't wedge
 /// the background task. On timeout the caller should break out of the loop to
 /// trigger reconnect.
-async fn ws_send_timeout(
-    ws: &mut WsStream,
-    msg: Message,
-    timeout_secs: u64,
-) -> Result<(), RelayError> {
-    tokio::time::timeout(Duration::from_secs(timeout_secs), ws.send(msg))
-        .await
-        .map_err(|_| RelayError::Timeout)?
-        .map_err(|e| RelayError::WebSocket(Box::new(e)))
+async fn ws_send_timeout(ws: &mut WsStream, msg: Message) -> Result<(), RelayError> {
+    tokio::time::timeout(
+        crate::settings::get().relay.ws_send_timeout_secs,
+        ws.send(msg),
+    )
+    .await
+    .map_err(|_| RelayError::Timeout)?
+    .map_err(|e| RelayError::WebSocket(Box::new(e)))
 }
 
 /// Parse the relay's `retry in {N}s` hint from a rate-limit message.
@@ -3521,8 +3492,8 @@ fn jittered_duration(base: Duration) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    // factor ∈ [0.8, 1.2)
-    let factor = 0.8 + (nanos as f64 / u32::MAX as f64) * 0.4;
+    let f = crate::settings::get().lib.jitter_fraction;
+    let factor = (1.0 - f) + (nanos as f64 / u32::MAX as f64) * 2.0 * f;
     base.mul_f64(factor)
 }
 
@@ -3532,7 +3503,7 @@ fn jittered_duration(base: Duration) -> Duration {
 /// resolver, covering macOS (`nodename nor servname`), Linux (`Name or service not
 /// known`), and common BSD/Windows variants (`No such host`,
 /// `failed to lookup address`). These are transient on brownouts and must NOT
-/// consume a backoff ladder rung — they retry on a flat `DNS_RETRY_INTERVAL`.
+/// consume a backoff ladder rung — they retry on a flat `dns_retry_interval_secs`.
 pub(crate) fn is_dns_error(err: &RelayError) -> bool {
     let msg = err.to_string();
     msg.contains("nodename nor servname")
@@ -3639,7 +3610,7 @@ async fn send_auth_response(
     };
 
     let auth_msg = serde_json::to_string(&json!(["AUTH", auth_event]))?;
-    ws_send_timeout(ws, Message::Text(auth_msg.into()), WS_SEND_TIMEOUT_SECS).await?;
+    ws_send_timeout(ws, Message::Text(auth_msg.into())).await?;
     debug!("sent AUTH response for challenge");
     Ok(())
 }
@@ -3863,7 +3834,10 @@ fn is_terminal_ws_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
         // Non-101 HTTP: terminal unless 408/429/5xx.
         WsError::Http(resp) => {
             let status = resp.status().as_u16();
-            !(status == 408 || status == 429 || (500..600).contains(&status))
+            let relay = &crate::settings::get().relay;
+            !(relay.ws_nonterminal_statuses.contains(&status)
+                || (relay.ws_nonterminal_status_range_min..relay.ws_nonterminal_status_range_max)
+                    .contains(&status))
         }
 
         // Protocol errors: most are deterministic upgrade mismatches.
@@ -3973,7 +3947,13 @@ where
     let mut last_err = None;
 
     for (attempt, delay) in std::iter::once(None)
-        .chain(STARTUP_CONNECT_BACKOFFS.iter().map(|d| Some(*d)))
+        .chain(
+            crate::settings::get()
+                .relay
+                .startup_connect_backoffs_secs
+                .iter()
+                .map(|d| Some(*d)),
+        )
         .enumerate()
     {
         if let Some(base) = delay {
@@ -4013,16 +3993,24 @@ async fn do_connect(
         .parse::<url::Url>()
         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
 
-    let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(parsed.as_str()))
-        .await
-        .map_err(|_| RelayError::ConnectionClosed)? // timeout → treat as connection failure
-        .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
+    let (ws, _response) = tokio::time::timeout(
+        crate::settings::get().relay.connect_timeout_secs,
+        connect_async(parsed.as_str()),
+    )
+    .await
+    .map_err(|_| RelayError::ConnectionClosed)? // timeout → treat as connection failure
+    .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
     debug!("connected to relay at {relay_url}");
 
     let mut ws = ws;
     let mut buffer: VecDeque<RelayMessage> = VecDeque::new();
 
-    let challenge = wait_for_auth_challenge(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+    let challenge = wait_for_auth_challenge(
+        &mut ws,
+        &mut buffer,
+        crate::settings::get().relay.auth_timeout_secs,
+    )
+    .await?;
 
     send_auth_response(&mut ws, &challenge, relay_url, keys, auth_tag).await?;
 
@@ -4032,7 +4020,12 @@ async fn do_connect(
         // message. Simpler: wait_for_ok accepts any OK (we just sent one event).
         // The event_id in the OK will match whatever we sent.
         // We'll accept the first OK we receive.
-        let ok = wait_for_any_ok(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+        let ok = wait_for_any_ok(
+            &mut ws,
+            &mut buffer,
+            crate::settings::get().relay.auth_timeout_secs,
+        )
+        .await?;
         if !ok.accepted {
             return Err(RelayError::AuthFailed(ok.message));
         }
@@ -4085,7 +4078,7 @@ async fn wait_for_auth_challenge(
                 }
             }
             Message::Ping(data) => {
-                ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
+                ws_send_timeout(ws, Message::Pong(data))
                     .await
                     .map_err(|_| RelayError::Timeout)?;
             }
@@ -4163,7 +4156,7 @@ async fn wait_for_any_ok(
                 }
             }
             Message::Ping(data) => {
-                ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
+                ws_send_timeout(ws, Message::Pong(data))
                     .await
                     .map_err(|_| RelayError::Timeout)?;
             }
@@ -4243,6 +4236,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_self_reads_and_normalizes_standard_root_document() {
+        crate::settings::init_for_tests();
         let uppercase = "AB".repeat(32);
         let responses = HashMap::from([
             (
@@ -4273,6 +4267,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_self_falls_back_to_info_alias() {
+        crate::settings::init_for_tests();
         let responses = HashMap::from([
             ("/".to_string(), (404, "not found".into())),
             (
@@ -4298,6 +4293,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_self_rejects_malformed_identity_at_both_endpoints() {
+        crate::settings::init_for_tests();
         let responses = HashMap::from([
             (
                 "/".to_string(),
@@ -4325,6 +4321,7 @@ mod tests {
 
     #[test]
     fn relay_ws_to_http_plain() {
+        crate::settings::init_for_tests();
         assert_eq!(
             relay_ws_to_http("ws://localhost:3000"),
             "http://localhost:3000"
@@ -4333,6 +4330,7 @@ mod tests {
 
     #[test]
     fn relay_ws_to_http_secure() {
+        crate::settings::init_for_tests();
         assert_eq!(
             relay_ws_to_http("wss://relay.example.com"),
             "https://relay.example.com"
@@ -4341,6 +4339,7 @@ mod tests {
 
     #[test]
     fn relay_ws_to_http_strips_trailing_slash() {
+        crate::settings::init_for_tests();
         assert_eq!(
             relay_ws_to_http("ws://localhost:3000/"),
             "http://localhost:3000"
@@ -4349,6 +4348,7 @@ mod tests {
 
     #[test]
     fn relay_ws_to_http_with_path() {
+        crate::settings::init_for_tests();
         assert_eq!(
             relay_ws_to_http("wss://relay.example.com/nostr"),
             "https://relay.example.com/nostr"
@@ -4357,6 +4357,7 @@ mod tests {
 
     #[test]
     fn relay_ws_to_http_with_port_and_path() {
+        crate::settings::init_for_tests();
         assert_eq!(
             relay_ws_to_http("wss://relay.example.com:4000/ws"),
             "https://relay.example.com:4000/ws"
@@ -4365,6 +4366,7 @@ mod tests {
 
     #[test]
     fn channel_sub_id_format() {
+        crate::settings::init_for_tests();
         let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
             channel_sub_id(uuid),
@@ -4374,6 +4376,7 @@ mod tests {
 
     #[test]
     fn channel_id_from_sub_id_roundtrip() {
+        crate::settings::init_for_tests();
         let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let sub_id = channel_sub_id(uuid);
         let recovered = channel_id_from_sub_id(&sub_id).unwrap();
@@ -4382,16 +4385,19 @@ mod tests {
 
     #[test]
     fn channel_id_from_sub_id_invalid_prefix() {
+        crate::settings::init_for_tests();
         assert!(channel_id_from_sub_id("sub-550e8400-e29b-41d4-a716-446655440000").is_none());
     }
 
     #[test]
     fn channel_id_from_sub_id_invalid_uuid() {
+        crate::settings::init_for_tests();
         assert!(channel_id_from_sub_id("ch-not-a-uuid").is_none());
     }
 
     #[test]
     fn channel_id_from_sub_id_empty() {
+        crate::settings::init_for_tests();
         assert!(channel_id_from_sub_id("").is_none());
     }
 
@@ -4413,6 +4419,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_preserves_missing_metadata_as_unknown() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let map = merge_discovered_channels(vec![channel], &serde_json::json!([]));
         assert_eq!(map[&channel].channel_type, "unknown");
@@ -4420,6 +4427,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_uses_declared_dm_type_without_hidden_hint() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(channel, "dm", &["t", "dm"])]);
         let map = merge_discovered_channels(vec![channel], &meta);
@@ -4428,6 +4436,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_skips_archived_metadata() {
+        crate::settings::init_for_tests();
         let live = Uuid::new_v4();
         let archived = Uuid::new_v4();
         let meta = serde_json::json!([
@@ -4447,6 +4456,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_skips_archived_even_when_still_a_member() {
+        crate::settings::init_for_tests();
         // The offline feeder: the agent is still listed as a member
         // (uuid present in channel_uuids, the kind:39002 membership set), but the
         // channel was reaped while the agent was offline. Even though the agent
@@ -4466,6 +4476,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_archived_false_is_kept() {
+        crate::settings::init_for_tests();
         // An explicit archived=false (e.g. after unarchive) must NOT be skipped.
         let ch = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(ch, "back", &["archived", "false"])]);
@@ -4477,6 +4488,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_parses_about_as_description() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(
             ch,
@@ -4494,6 +4506,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_blank_about_is_none() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(ch, "team", &["about", "   "])]);
 
@@ -4507,6 +4520,7 @@ mod tests {
 
     #[test]
     fn merge_discovered_channels_missing_about_is_none() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let meta = serde_json::json!([meta_event(ch, "team", &["t", "stream"])]);
 
@@ -4517,6 +4531,7 @@ mod tests {
 
     #[test]
     fn parse_ok_accepted() {
+        crate::settings::init_for_tests();
         let text = r#"["OK","abc123",true,""]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4535,6 +4550,7 @@ mod tests {
 
     #[test]
     fn parse_ok_rejected() {
+        crate::settings::init_for_tests();
         let text = r#"["OK","abc123",false,"blocked: spam"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4553,6 +4569,7 @@ mod tests {
 
     #[test]
     fn parse_eose() {
+        crate::settings::init_for_tests();
         let text = r#"["EOSE","sub-1"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4565,6 +4582,7 @@ mod tests {
 
     #[test]
     fn parse_notice() {
+        crate::settings::init_for_tests();
         let text = r#"["NOTICE","hello from relay"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4577,6 +4595,7 @@ mod tests {
 
     #[test]
     fn parse_notice_empty() {
+        crate::settings::init_for_tests();
         let text = r#"["NOTICE"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4589,6 +4608,7 @@ mod tests {
 
     #[test]
     fn parse_auth() {
+        crate::settings::init_for_tests();
         let text = r#"["AUTH","some-challenge-string"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4601,6 +4621,7 @@ mod tests {
 
     #[test]
     fn parse_closed() {
+        crate::settings::init_for_tests();
         let text = r#"["CLOSED","sub-2","error: rate-limited"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4617,6 +4638,7 @@ mod tests {
 
     #[test]
     fn parse_closed_no_message() {
+        crate::settings::init_for_tests();
         let text = r#"["CLOSED","sub-3"]"#;
         let msg = parse_relay_message(text).unwrap();
         match msg {
@@ -4633,6 +4655,7 @@ mod tests {
 
     #[test]
     fn parse_unknown_type_returns_error() {
+        crate::settings::init_for_tests();
         let text = r#"["UNKNOWN","data"]"#;
         let result = parse_relay_message(text);
         assert!(result.is_err());
@@ -4646,6 +4669,7 @@ mod tests {
 
     #[test]
     fn parse_invalid_json_returns_error() {
+        crate::settings::init_for_tests();
         let text = "not json at all";
         let result = parse_relay_message(text);
         assert!(result.is_err());
@@ -4654,6 +4678,7 @@ mod tests {
 
     #[test]
     fn parse_empty_array_returns_error() {
+        crate::settings::init_for_tests();
         let text = "[]";
         let result = parse_relay_message(text);
         assert!(result.is_err());
@@ -4665,6 +4690,7 @@ mod tests {
 
     #[test]
     fn parse_auth_missing_challenge_returns_error() {
+        crate::settings::init_for_tests();
         let text = r#"["AUTH"]"#;
         let result = parse_relay_message(text);
         assert!(result.is_err());
@@ -4672,6 +4698,7 @@ mod tests {
 
     #[test]
     fn parse_eose_missing_sub_id_returns_error() {
+        crate::settings::init_for_tests();
         let text = r#"["EOSE"]"#;
         let result = parse_relay_message(text);
         assert!(result.is_err());
@@ -4679,6 +4706,7 @@ mod tests {
 
     #[test]
     fn subscription_id_starts_with_ch_prefix() {
+        crate::settings::init_for_tests();
         let uuid = Uuid::new_v4();
         let sub_id = channel_sub_id(uuid);
         assert!(sub_id.starts_with("ch-"));
@@ -4686,6 +4714,7 @@ mod tests {
 
     #[test]
     fn subscription_id_contains_full_uuid() {
+        crate::settings::init_for_tests();
         let uuid = Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
         let sub_id = channel_sub_id(uuid);
         assert_eq!(sub_id, "ch-12345678-1234-5678-1234-567812345678");
@@ -4787,6 +4816,7 @@ mod tests {
 
     #[tokio::test]
     async fn verified_channel_event_is_recorded_and_forwarded() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let (observer_control_tx, mut observer_control_rx) = mpsc::channel(4);
@@ -4820,6 +4850,7 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_channel_events_are_dropped_before_state_or_queue_changes() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (observer_control_tx, _observer_control_rx) = mpsc::channel(4);
@@ -4892,6 +4923,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_membership_notification_is_dropped_before_state_or_queue_changes() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let (observer_control_tx, _observer_control_rx) = mpsc::channel(4);
@@ -4936,6 +4968,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_observer_control_is_dropped_before_control_queue() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, _event_rx) = mpsc::channel(4);
         let (observer_control_tx, mut observer_control_rx) = mpsc::channel(4);
@@ -4985,6 +5018,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_reconnect_preserves_gate_until_pending_replay_resumes() {
+        crate::settings::init_for_tests();
         let (mut client, mut server) = test_ws_pair().await;
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(1);
         let mut state = BgState::new();
@@ -5018,6 +5052,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_during_replay_pacing_is_sent_on_live_socket() {
+        crate::settings::init_for_tests();
         let (client, mut server) = test_ws_pair().await;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let mut state = BgState::new();
@@ -5059,6 +5094,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe_during_replay_pacing_sends_close_on_live_socket() {
+        crate::settings::init_for_tests();
         let (client, mut server) = test_ws_pair().await;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let mut state = BgState::new();
@@ -5094,6 +5130,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_during_replay_pacing_is_sent_on_live_socket() {
+        crate::settings::init_for_tests();
         let (client, mut server) = test_ws_pair().await;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let mut state = BgState::new();
@@ -5135,6 +5172,7 @@ mod tests {
 
     #[test]
     fn failed_replay_retains_deferred_subscription_intent_in_fifo_order() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let kept_channel = Uuid::new_v4();
         let removed_channel = Uuid::new_v4();
@@ -5163,6 +5201,7 @@ mod tests {
 
     #[test]
     fn bg_state_dedup_first_event_accepted() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys = nostr::Keys::generate();
@@ -5175,6 +5214,7 @@ mod tests {
 
     #[test]
     fn bg_state_dedup_duplicate_rejected() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys = nostr::Keys::generate();
@@ -5191,6 +5231,7 @@ mod tests {
 
     #[test]
     fn bg_state_dedup_different_ids_both_accepted() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         // Two different keys → two different event IDs.
@@ -5204,6 +5245,7 @@ mod tests {
 
     #[test]
     fn bg_state_last_seen_set_on_first_event() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys = nostr::Keys::generate();
@@ -5214,6 +5256,7 @@ mod tests {
 
     #[test]
     fn bg_state_last_seen_advances_on_newer_event() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys1 = nostr::Keys::generate();
@@ -5227,6 +5270,7 @@ mod tests {
 
     #[test]
     fn bg_state_last_seen_does_not_regress_on_older_event() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys1 = nostr::Keys::generate();
@@ -5241,6 +5285,7 @@ mod tests {
 
     #[test]
     fn bg_state_last_seen_independent_per_channel() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let ch1 = Uuid::new_v4();
         let ch2 = Uuid::new_v4();
@@ -5262,7 +5307,8 @@ mod tests {
     /// IDs from both generations are still recognised as duplicates.
     #[test]
     fn bg_state_two_gen_dedup_no_amnesia_on_rotation() {
-        let mut dedup = TwoGenDedup::new(SEEN_ID_LIMIT);
+        crate::settings::init_for_tests();
+        let mut dedup = TwoGenDedup::new(crate::settings::get().relay.seen_id_limit);
 
         // Fill current generation to the rotation threshold (limit/2 = 6_000).
         // After inserting the 6_000th item, current rotates into previous.
@@ -5296,6 +5342,7 @@ mod tests {
 
     #[test]
     fn bg_state_two_gen_dedup_duplicate_rejected_across_generations() {
+        crate::settings::init_for_tests();
         let mut dedup = TwoGenDedup::new(12);
         // limit/2 = 6, so rotation happens at 6 inserts.
         for i in 0u64..6 {
@@ -5310,13 +5357,14 @@ mod tests {
 
     #[test]
     fn bg_state_seen_ids_cleared_at_limit() {
+        crate::settings::init_for_tests();
         // Compatibility test: BgState.record_event still deduplicates correctly
         // after the TwoGenDedup rotation threshold is crossed.
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
         // Insert SEEN_ID_LIMIT/2 synthetic IDs to trigger the first rotation.
-        for i in 0u64..(SEEN_ID_LIMIT as u64 / 2) {
+        for i in 0u64..(crate::settings::get().relay.seen_id_limit as u64 / 2) {
             state.seen_ids.insert(format!("{:0>64x}", i));
         }
 
@@ -5352,6 +5400,7 @@ mod tests {
     /// - Third drop at ts=500 (earlier) → entry updates to 500 (min)
     #[test]
     fn acp_records_channel_dropped_since_on_backpressure() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
@@ -5395,12 +5444,13 @@ mod tests {
         );
     }
 
-    /// Test 9: reconnect since filter = min(last_seen, channel_dropped_since) - SINCE_SKEW_SECS.
+    /// Test 9: reconnect since filter = min(last_seen, channel_dropped_since) - crate::settings::get().relay.since_skew_secs.as_secs().
     ///
     /// With last_seen=1000 and channel_dropped_since=900, the effective since
-    /// passed to send_subscribe should be min(1000, 900) - SINCE_SKEW_SECS = 895.
+    /// passed to send_subscribe should be min(1000, 900) - crate::settings::get().relay.since_skew_secs.as_secs() = 895.
     #[test]
     fn acp_reconnect_uses_dropped_since_for_replay() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
@@ -5411,15 +5461,18 @@ mod tests {
         // Compute the since value the reconnect path would use.
         let since = state.channel_since(&channel_id);
 
-        // The since passed to send_subscribe (which subtracts SINCE_SKEW_SECS internally).
+        // The since passed to send_subscribe (which subtracts crate::settings::get().relay.since_skew_secs.as_secs() internally).
         assert_eq!(since, Some(900), "since should be min(1000, 900) = 900");
 
         // After subtracting skew (as send_subscribe does), the REQ filter value is:
-        let req_since = since.unwrap().saturating_sub(SINCE_SKEW_SECS);
+        let req_since = since
+            .unwrap()
+            .saturating_sub(crate::settings::get().relay.since_skew_secs.as_secs());
         assert_eq!(
-            req_since, 895,
+            req_since,
+            895,
             "REQ since filter should be 900 - {} = 895",
-            SINCE_SKEW_SECS
+            crate::settings::get().relay.since_skew_secs.as_secs()
         );
 
         // Simulate clearing after resubscribe.
@@ -5432,6 +5485,7 @@ mod tests {
 
     #[test]
     fn dynamic_subscribe_records_membership_replay_floor() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         state.startup_watermark = Some(2_000);
         let channel_id = Uuid::new_v4();
@@ -5469,6 +5523,7 @@ mod tests {
     /// The fix uses `seen_ids.insert()` directly.
     #[test]
     fn membership_dedup_does_not_touch_last_seen() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         let keys = nostr::Keys::generate();
@@ -5500,6 +5555,7 @@ mod tests {
     /// rejected as a duplicate on replay.
     #[test]
     fn membership_backpressure_removes_dedup_id() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let keys = nostr::Keys::generate();
 
@@ -5538,6 +5594,7 @@ mod tests {
 
     #[test]
     fn not_a_channel_member_drops_channel_without_reconnect() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         subscribe_channel(&mut state, channel_id);
@@ -5561,6 +5618,7 @@ mod tests {
 
     #[test]
     fn channel_access_revoked_drops_channel_without_reconnect() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         subscribe_channel(&mut state, channel_id);
@@ -5578,6 +5636,7 @@ mod tests {
 
     #[test]
     fn insufficient_scope_is_not_dropped_and_reconnects() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         subscribe_channel(&mut state, channel_id);
@@ -5600,6 +5659,7 @@ mod tests {
 
     #[test]
     fn auth_required_is_not_dropped_and_reconnects() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         subscribe_channel(&mut state, channel_id);
@@ -5619,6 +5679,7 @@ mod tests {
 
     #[test]
     fn already_removed_channel_is_a_no_op() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         // Channel was never subscribed (or already dropped) — a delayed CLOSED.
@@ -5641,6 +5702,7 @@ mod tests {
 
     #[test]
     fn dropped_channel_is_not_resubscribed_so_loop_cannot_re_form() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         subscribe_channel(&mut state, channel_id);
@@ -5670,6 +5732,7 @@ mod tests {
     /// is a code-review gap, not a silent misclassification.
     #[test]
     fn connect_error_classification_matches_every_relay_error_variant() {
+        crate::settings::init_for_tests();
         use tokio_tungstenite::tungstenite::error::{
             CapacityError, Error as WsError, ProtocolError, SubProtocolError, TlsError, UrlError,
         };
@@ -6146,6 +6209,7 @@ mod tests {
     /// the handshake gets. Either way it must not be retried.
     #[tokio::test]
     async fn do_connect_wrong_scheme_is_terminal() {
+        crate::settings::init_for_tests();
         let keys = nostr::Keys::generate();
         let err = do_connect("https://example.com", &keys, None)
             .await
@@ -6160,6 +6224,7 @@ mod tests {
     /// link) must be retried and can still succeed once the link recovers.
     #[tokio::test(start_paused = true)]
     async fn retry_initial_connect_retries_transient_failure_then_succeeds() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -6188,6 +6253,7 @@ mod tests {
     /// surfacing a real problem to the caller.
     #[tokio::test(start_paused = true)]
     async fn retry_initial_connect_does_not_retry_terminal_error() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -6211,6 +6277,7 @@ mod tests {
     /// auth rejection.
     #[tokio::test(start_paused = true)]
     async fn retry_initial_connect_retries_relay_dependency_fault() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -6241,6 +6308,7 @@ mod tests {
     /// dead relay must not hang agent startup indefinitely.
     #[tokio::test(start_paused = true)]
     async fn retry_initial_connect_exhausts_and_returns_last_error() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -6256,7 +6324,11 @@ mod tests {
         );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            STARTUP_CONNECT_BACKOFFS.len() + 1,
+            crate::settings::get()
+                .relay
+                .startup_connect_backoffs_secs
+                .len()
+                + 1,
             "must attempt exactly once plus one retry per backoff entry"
         );
     }
@@ -6266,6 +6338,7 @@ mod tests {
     /// test itself stays fast (virtual time, not wall-clock sleeps).
     #[tokio::test(start_paused = true)]
     async fn retry_initial_connect_sleeps_between_attempts() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -6301,6 +6374,7 @@ mod tests {
     /// parse_rate_limit_retry_secs: full hint extracts the N from "retry in Ns".
     #[test]
     fn parse_rate_limit_retry_secs_with_hint() {
+        crate::settings::init_for_tests();
         assert_eq!(
             parse_rate_limit_retry_secs("rate-limited: quota exceeded; retry in 12s"),
             Some(12)
@@ -6310,6 +6384,7 @@ mod tests {
     /// parse_rate_limit_retry_secs: message without a hint returns None.
     #[test]
     fn parse_rate_limit_retry_secs_missing_hint() {
+        crate::settings::init_for_tests();
         assert_eq!(
             parse_rate_limit_retry_secs("rate-limited: too many concurrent requests"),
             None
@@ -6319,6 +6394,7 @@ mod tests {
     /// parse_rate_limit_retry_secs: explicit zero value is returned as Some(0).
     #[test]
     fn parse_rate_limit_retry_secs_zero() {
+        crate::settings::init_for_tests();
         assert_eq!(
             parse_rate_limit_retry_secs("rate-limited: quota exceeded; retry in 0s"),
             Some(0)
@@ -6328,6 +6404,7 @@ mod tests {
     /// parse_rate_limit_retry_secs: garbage input returns None.
     #[test]
     fn parse_rate_limit_retry_secs_garbage() {
+        crate::settings::init_for_tests();
         assert_eq!(
             parse_rate_limit_retry_secs("not a rate limit message"),
             None
@@ -6338,6 +6415,7 @@ mod tests {
     /// check_rate_gate returns Some while active and lazily clears on expiry.
     #[tokio::test(start_paused = true)]
     async fn rate_limit_gate_set_and_expiry() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         assert!(
             state.check_rate_gate().is_none(),
@@ -6367,6 +6445,7 @@ mod tests {
     /// set_rate_limit_gate takes the max of overlapping deadlines.
     #[tokio::test(start_paused = true)]
     async fn rate_limit_gate_extends_to_max() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
 
         // Arm with a long hint first.
@@ -6392,6 +6471,7 @@ mod tests {
     /// must fail this test.
     #[tokio::test]
     async fn rate_limited_ok_arms_gate_and_reparks_refused_observer_frame() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, _event_rx) = mpsc::channel::<Option<BuzzEvent>>(4);
         let (observer_control_tx, _observer_control_rx) = mpsc::channel::<Event>(4);
@@ -6456,6 +6536,7 @@ mod tests {
 
     #[test]
     fn rejected_observer_frame_displaces_oldest_parked_frame_at_capacity() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let keys = Keys::generate();
         let refused = make_observer_frame(&keys);
@@ -6463,8 +6544,9 @@ mod tests {
 
         let oldest = make_observer_frame(&keys);
         state.park_gated_observer_frame(Box::new(oldest.clone()));
-        let mut survivors = Vec::with_capacity(GATED_OBSERVER_QUEUE_CAP - 1);
-        for _ in 1..GATED_OBSERVER_QUEUE_CAP {
+        let mut survivors =
+            Vec::with_capacity(crate::settings::get().relay.gated_observer_queue_cap - 1);
+        for _ in 1..crate::settings::get().relay.gated_observer_queue_cap {
             let event = make_observer_frame(&keys);
             survivors.push(event.id);
             state.park_gated_observer_frame(Box::new(event));
@@ -6477,7 +6559,10 @@ mod tests {
             .iter()
             .map(|event| event.id)
             .collect();
-        assert_eq!(parked.len(), GATED_OBSERVER_QUEUE_CAP);
+        assert_eq!(
+            parked.len(),
+            crate::settings::get().relay.gated_observer_queue_cap
+        );
         assert_eq!(parked.first(), Some(&refused.id));
         assert_eq!(&parked[1..], survivors.as_slice());
         assert!(!parked.contains(&oldest.id));
@@ -6490,6 +6575,7 @@ mod tests {
     /// backoff gate stays disarmed.
     #[tokio::test]
     async fn non_rate_limited_ok_rejection_retires_frame_without_arming_gate() {
+        crate::settings::init_for_tests();
         let (mut client, _server) = test_ws_pair().await;
         let (event_tx, _event_rx) = mpsc::channel::<Option<BuzzEvent>>(4);
         let (observer_control_tx, _observer_control_rx) = mpsc::channel::<Event>(4);
@@ -6553,6 +6639,7 @@ mod tests {
     /// gate clears. A typing indicator in the same window stays dropped.
     #[tokio::test]
     async fn gated_observer_frame_is_parked_then_drained_not_dropped() {
+        crate::settings::init_for_tests();
         let (mut client, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
         let keys = Keys::generate();
@@ -6625,6 +6712,7 @@ mod tests {
     /// already expired.
     #[tokio::test]
     async fn observer_frames_queue_behind_parked_backlog_in_order() {
+        crate::settings::init_for_tests();
         let (mut client, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
         let keys = Keys::generate();
@@ -6679,6 +6767,7 @@ mod tests {
 
     #[test]
     fn observer_notice_requeues_unacknowledged_frames_and_ok_retires_them() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let keys = Keys::generate();
         let accepted = make_observer_frame(&keys);
@@ -6704,21 +6793,25 @@ mod tests {
     /// counts it; the drain resets the counter after logging the summary.
     #[tokio::test]
     async fn gated_observer_queue_drops_oldest_on_overflow() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let keys = Keys::generate();
         let first = make_observer_frame(&keys);
         state.park_gated_observer_frame(Box::new(first.clone()));
-        for _ in 1..GATED_OBSERVER_QUEUE_CAP {
+        for _ in 1..crate::settings::get().relay.gated_observer_queue_cap {
             state.park_gated_observer_frame(Box::new(make_observer_frame(&keys)));
         }
-        assert_eq!(state.gated_observer_pending.len(), GATED_OBSERVER_QUEUE_CAP);
+        assert_eq!(
+            state.gated_observer_pending.len(),
+            crate::settings::get().relay.gated_observer_queue_cap
+        );
         assert_eq!(state.gated_observer_dropped, 0);
 
         let overflow = make_observer_frame(&keys);
         state.park_gated_observer_frame(Box::new(overflow.clone()));
         assert_eq!(
             state.gated_observer_pending.len(),
-            GATED_OBSERVER_QUEUE_CAP,
+            crate::settings::get().relay.gated_observer_queue_cap,
             "queue must stay bounded"
         );
         assert_eq!(state.gated_observer_dropped, 1, "loss must be counted");
@@ -6740,6 +6833,7 @@ mod tests {
     /// the production shape: a WebSocket I/O error wrapping the OS message.
     #[test]
     fn is_dns_error_classification() {
+        crate::settings::init_for_tests();
         use tokio_tungstenite::tungstenite;
 
         // macOS resolver (Http-wrapped, used in many existing tests)
@@ -6778,6 +6872,7 @@ mod tests {
     /// This exercises BgState directly since we have no live socket in unit tests.
     #[test]
     fn resubscribe_retry_populated_on_failure() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
@@ -6814,6 +6909,7 @@ mod tests {
     /// After the gate expires the drain re-arms the sub and clears the flag.
     #[tokio::test(start_paused = true)]
     async fn membership_resub_flag_set_on_rate_limited_closed() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         state.membership_sub_active = true;
 
@@ -6850,6 +6946,7 @@ mod tests {
     /// A rate-limited CLOSED for the observer control sub sets observer_resub_needed.
     #[test]
     fn observer_resub_flag_set_on_rate_limited_closed() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         state.observer_control_sub_active = true;
 
@@ -6869,6 +6966,7 @@ mod tests {
     /// failure stays in pending and is not immediately retried.
     #[tokio::test(start_paused = true)]
     async fn rate_limited_pending_failure_requeues_with_penalty() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
@@ -6909,6 +7007,7 @@ mod tests {
     /// rate_limited_pending and removes it from resubscribe_retry.
     #[tokio::test(start_paused = true)]
     async fn resubscribe_retry_gate_rearm_moves_to_pending() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 
@@ -6944,6 +7043,7 @@ mod tests {
     /// clears channel_dropped_since.
     #[test]
     fn resubscribe_retry_success_clears_state() {
+        crate::settings::init_for_tests();
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
 

@@ -81,11 +81,12 @@ pub(crate) async fn execute(
         if let Some(session) = session {
             // Cancellation is best effort; the terminal status remains the cause
             // that won above, even if the adapter returns end_turn during drain.
+            let settings = &crate::settings::get().isolated_execution;
             let _ = tokio::time::timeout(
-                Duration::from_secs(5),
+                settings.outer_cancel_secs,
                 agent
                     .acp
-                    .cancel_with_cleanup_grace(&session, Duration::from_secs(5)),
+                    .cancel_with_cleanup_grace(&session, settings.cancel_grace_secs),
             )
             .await;
         }

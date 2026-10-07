@@ -7,9 +7,6 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
-
 #[derive(Debug)]
 pub(crate) enum PoolLifecycle<P> {
     Listening,
@@ -123,11 +120,13 @@ impl<P> PoolLifecycle<P> {
 fn retry_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(63);
     let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let settings = &crate::settings::get().pool_lifecycle;
     Duration::from_secs(
-        INITIAL_RETRY_DELAY
+        settings
+            .initial_retry_delay_secs
             .as_secs()
             .saturating_mul(multiplier)
-            .min(MAX_RETRY_DELAY.as_secs()),
+            .min(settings.max_retry_delay_secs.as_secs()),
     )
 }
 
@@ -137,6 +136,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_pending_event_starts_exactly_one_wake() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
 
@@ -148,6 +148,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failure_retries_only_when_work_exists_and_deadline_is_due() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
@@ -172,6 +173,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_backoff_doubles_and_caps_at_five_minutes() {
+        crate::settings::init_for_tests();
         let mut now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
 
@@ -191,16 +193,23 @@ mod tests {
                 _ => panic!("failure must enter Failed"),
             };
             assert_eq!(retry_at, now + expected);
-            assert!(expected <= MAX_RETRY_DELAY);
+            assert!(expected <= crate::settings::get().pool_lifecycle.max_retry_delay_secs);
             now = retry_at;
         }
 
-        assert_eq!(retry_delay(7), MAX_RETRY_DELAY);
-        assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
+        assert_eq!(
+            retry_delay(7),
+            crate::settings::get().pool_lifecycle.max_retry_delay_secs
+        );
+        assert_eq!(
+            retry_delay(u32::MAX),
+            crate::settings::get().pool_lifecycle.max_retry_delay_secs
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn successful_retry_consumes_pool_and_stops_future_wakes() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
@@ -224,6 +233,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stale_or_duplicate_wake_result_is_rejected() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(
@@ -242,6 +252,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stale_attempt_result_cannot_replace_current_wake() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<&str>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
@@ -267,6 +278,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_wake_enters_failed_and_can_retry() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
@@ -281,6 +293,7 @@ mod tests {
 
     #[test]
     fn take_ready_transfers_pool_exactly_once() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
@@ -291,6 +304,7 @@ mod tests {
 
     #[test]
     fn failed_state_preserves_attempt_deadline_and_error() {
+        crate::settings::init_for_tests();
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));

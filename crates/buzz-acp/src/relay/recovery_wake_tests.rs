@@ -44,6 +44,7 @@ async fn review_barrier(server: &mut WebSocketStream<tokio::net::TcpStream>) -> 
 
 #[tokio::test]
 async fn review_recurring_headroom_between_ticks_gets_an_attempt() {
+    crate::settings::init_for_tests();
     let (client, mut server) = test_ws_pair().await;
     let (tx, mut rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
@@ -227,6 +228,7 @@ impl Owner {
 
 #[tokio::test]
 async fn capacity_flapping_cannot_storm_or_delay_an_allowed_attempt() {
+    crate::settings::init_for_tests();
     let mut owner = Owner::new(1).await;
     owner.event(0).await;
     owner.event(1).await;
@@ -260,6 +262,7 @@ async fn capacity_flapping_cannot_storm_or_delay_an_allowed_attempt() {
 
 #[tokio::test]
 async fn partial_capacity_wait_does_not_steal_live_slots_and_cancels_on_unsubscribe() {
+    crate::settings::init_for_tests();
     let mut owner = Owner::new(5).await; // odd capacity: threshold rounds UP to 3
     for n in 0..6 {
         owner.event(n).await;
@@ -311,7 +314,7 @@ async fn partial_capacity_wait_does_not_steal_live_slots_and_cancels_on_unsubscr
     );
 
     // Wait out cooldown then create another pending loss and partial reservation.
-    tokio::time::sleep(recovery::RECOVERY_INTERVAL).await;
+    tokio::time::sleep(crate::settings::get().relay.recovery_interval_secs).await;
     for n in 7..13 {
         owner.event(n).await;
     }
@@ -353,6 +356,7 @@ async fn partial_capacity_wait_does_not_steal_live_slots_and_cancels_on_unsubscr
 
 #[tokio::test]
 async fn shutdown_and_transport_loss_cancel_a_capacity_wait() {
+    crate::settings::init_for_tests();
     let mut owner = Owner::new(1).await;
     owner.event(0).await;
     owner.event(1).await;
@@ -369,6 +373,7 @@ async fn shutdown_and_transport_loss_cancel_a_capacity_wait() {
 
 #[tokio::test]
 async fn readiness_gate_ownership_and_attempt_deadlines_are_not_polling_ticks() {
+    crate::settings::init_for_tests();
     let (mut client, mut server) = test_ws_pair().await;
     let mut state = BgState::new();
     let ch = Uuid::new_v4();
@@ -435,6 +440,7 @@ async fn readiness_gate_ownership_and_attempt_deadlines_are_not_polling_ticks() 
 
 #[tokio::test]
 async fn readiness_uses_channel_wakes_without_idle_churn_or_lost_capacity() {
+    crate::settings::init_for_tests();
     use std::future::Future;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},

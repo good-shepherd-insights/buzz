@@ -1,5 +1,6 @@
 #[test]
 fn goose_uses_system_prompt_only_after_custom_method_succeeds() {
+    crate::settings::init_for_tests();
     assert!(!has_system_prompt_support(2, "goose", None));
     assert!(!has_system_prompt_support(2, "goose", Some(false)));
     assert!(has_system_prompt_support(2, "goose", Some(true)));
@@ -22,11 +23,21 @@ fn goose_uses_system_prompt_only_after_custom_method_succeeds() {
     );
     // claude-agent-acp gets ClaudeMeta transport regardless of protocol version.
     assert_eq!(
-        session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+        session_new_system_prompt(
+            false,
+            1,
+            crate::settings::get().pool.claude_agent_acp_name.as_str(),
+            Some("instructions")
+        ),
         Some(SystemPromptTransport::ClaudeMeta("instructions"))
     );
     assert_eq!(
-        session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+        session_new_system_prompt(
+            true,
+            1,
+            crate::settings::get().pool.claude_agent_acp_name.as_str(),
+            Some("instructions")
+        ),
         None,
         "goose path must never produce a transport even when agent_name matches"
     );
@@ -34,14 +45,24 @@ fn goose_uses_system_prompt_only_after_custom_method_succeeds() {
 
 #[test]
 fn claude_agent_acp_has_system_prompt_support_regardless_of_protocol_version() {
+    crate::settings::init_for_tests();
     // claude-agent-acp declares protocolVersion:1 but supports _meta.systemPrompt;
     // has_system_prompt_support must return true so user-message framing is suppressed.
-    assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
-    assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+    assert!(has_system_prompt_support(
+        1,
+        crate::settings::get().pool.claude_agent_acp_name.as_str(),
+        None
+    ));
+    assert!(has_system_prompt_support(
+        2,
+        crate::settings::get().pool.claude_agent_acp_name.as_str(),
+        None
+    ));
 }
 
 #[test]
 fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
+    crate::settings::init_for_tests();
     // The renamed @zed-industries package predates the _meta.systemPrompt support,
     // so it must not be treated as capable and stays on legacy user-message framing.
     let old_name = "@zed-industries/claude-code-acp";
@@ -51,14 +72,29 @@ fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
 
 #[test]
 fn pi_prompt_support_uses_metadata_regardless_of_protocol_version() {
+    crate::settings::init_for_tests();
     for version in [1, 2] {
-        assert!(has_system_prompt_support(version, BUZZ_PI_ACP_NAME, None));
+        assert!(has_system_prompt_support(
+            version,
+            crate::settings::get().acp.buzz_pi_acp_name.as_str(),
+            None
+        ));
         assert_eq!(
-            session_new_system_prompt(false, version, BUZZ_PI_ACP_NAME, Some("instructions")),
+            session_new_system_prompt(
+                false,
+                version,
+                crate::settings::get().acp.buzz_pi_acp_name.as_str(),
+                Some("instructions")
+            ),
             Some(SystemPromptTransport::PiMeta("instructions"))
         );
         assert_eq!(
-            session_new_system_prompt(false, version, BUZZ_PI_ACP_NAME, None),
+            session_new_system_prompt(
+                false,
+                version,
+                crate::settings::get().acp.buzz_pi_acp_name.as_str(),
+                None
+            ),
             None
         );
     }
@@ -66,6 +102,7 @@ fn pi_prompt_support_uses_metadata_regardless_of_protocol_version() {
 
 #[test]
 fn upstream_pi_acp_does_not_receive_fork_specific_prompt_metadata() {
+    crate::settings::init_for_tests();
     assert!(!has_system_prompt_support(1, "pi-acp", None));
     assert_eq!(
         session_new_system_prompt(false, 1, "pi-acp", Some("instructions")),
