@@ -879,9 +879,10 @@ ellipsis = '…'
 # link are read from the Multica account. A line below is an override:
 # uncomment it only to change the default. Durations are integer seconds.
 # Status lists, when set, must be non-empty and must not share a status.
-#[goal]
-#[goal.multica]
+[goal]
+[goal.multica]
 # url = "https://api.multica.ai"
+workspace_id = "bc24b790-8a8d-4037-8015-60dcc2891c87"
 # workspace_id = ""
 # agent_id = ""
 # reaction_created = "🎫"
@@ -898,7 +899,7 @@ ellipsis = '…'
 # title_max_chars = 120
 # list_page_size = 100
 # reconcile_prompt_tag = "issue"
-#[goal.classifier]
+[goal.classifier]
 # Fastino is not optional. A blank url or model still calls
 # GLiNER-2.5-Decide. An idle model can take minutes to wake, so the timeout
 # is 300 seconds and HTTP 425, 429, and 503 are retried.
@@ -909,7 +910,7 @@ ellipsis = '…'
 # min_confidence = 0.7
 # fallback = "ask"
 # timeout_secs = 300
-#[goal.guard]
+[goal.guard]
 # Prompts and the continuation cap. Set any of these in the environment:
 # BUZZ_ACP_SET__GOAL__GUARD__NAME_PROMPT
 # BUZZ_ACP_SET__GOAL__PHASES__TODO
@@ -935,7 +936,7 @@ ellipsis = '…'
 # continue_prompt = "{key} is still {status}. Continue the work, or move the issue to its true status."
 # explain_prompt = "{key} is {status}. Say in this thread what is blocking it before you stop."
 # issue_instructions = "This thread is tracked as {key} ({url}). Keep its status current in Multica."
-#[goal.answer]
+[goal.answer]
 # verify_retries = 3
 # verify_retry_secs = 2
 # not_found_notice = "The answer could not be confirmed on the relay."
