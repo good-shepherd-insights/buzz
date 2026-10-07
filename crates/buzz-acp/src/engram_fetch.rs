@@ -17,14 +17,6 @@ use nostr::{Event, Keys, PublicKey};
 
 use crate::relay::RestClient;
 
-/// Onboarding nudge for new agents with no core yet.
-///
-/// Wording is from Tyler's brief: "No core memory found. Use `buzz mem`
-/// to create a core memory. Ask your user about yourself."
-pub const ONBOARDING_NUDGE: &str = "No core memory found. \
-Use `buzz mem set core \"…\"` to create one (it will hold your identity, \
-rules, and goals across sessions). Ask your user about yourself.";
-
 /// Build the rendered prompt section for the agent's core.
 ///
 /// Returns:
@@ -45,7 +37,7 @@ pub async fn build_core_section(
         )),
         Ok(None) => Some(crate::prompt_framing::semantic_section(
             "core-memory",
-            ONBOARDING_NUDGE,
+            &crate::settings::get().engram.onboarding_nudge,
         )),
         Err(reason) => {
             tracing::warn!(
@@ -81,7 +73,7 @@ async fn fetch_core_body(
             nostr::SingleLetterTag::lowercase(nostr::Alphabet::P),
             [owner.to_hex()],
         )
-        .limit(16);
+        .limit(crate::settings::get().engram.core_fetch_limit as usize);
 
     let value = rest
         .query(&[filter])

@@ -5,11 +5,16 @@ mod git;
 mod git_runtime_tests;
 
 mod acp;
+mod classifier;
 mod config;
+mod delivery;
 mod edit_routing;
 mod engram_fetch;
 mod filter;
+mod goal;
 mod isolated_execution;
+mod issue_sweep;
+mod multica;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -22,7 +27,9 @@ mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
+mod settings;
 mod setup_mode;
+mod stop_guard;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -70,13 +77,6 @@ use uuid::Uuid;
 fn is_subcommand(name: &str) -> bool {
     std::env::args().nth(1).map(|a| a == name).unwrap_or(false)
 }
-
-/// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
-const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
-/// human interaction, so it must not share the short probe timeout.
-const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Resolve the process working directory for ACP session metadata and prompts.
 ///
@@ -204,8 +204,8 @@ impl OwnerCache {
     /// Cache a sibling lookup result.
     fn cache_sibling(&self, author: String, is_sibling: bool) {
         if let Ok(mut map) = self.siblings.lock() {
-            // Cap at 256 entries to prevent unbounded growth.
-            if map.len() >= 256 {
+            // Capped to prevent unbounded growth.
+            if map.len() >= settings::get().lib.sibling_cache_max {
                 map.clear();
             }
             map.insert(author, is_sibling);
@@ -648,7 +648,7 @@ impl QueuedNormalListenerEvent {
         let rest_client = rest_client.clone();
         let event_id = self.reaction_target_id.clone();
         tokio::spawn(async move {
-            pool::reaction_add(&rest_client, &event_id, "👀").await;
+            pool::reaction_add(&rest_client, &event_id, &settings::get().pool.reaction_seen).await;
         });
     }
 
@@ -737,6 +737,7 @@ impl NormalListenerIngress {
             prompt_tag: prompt_tag.clone(),
             received_at,
             edit: edit.clone(),
+            issue: None,
         };
         let channel_id = buzz_event.channel_id;
         let accepted = queue.push(QueuedEvent {
@@ -746,6 +747,7 @@ impl NormalListenerIngress {
             received_at,
             prompt_tag,
             edit,
+            issue: None,
         });
         QueuedNormalListenerEvent {
             accepted,
@@ -861,8 +863,11 @@ async fn check_sibling_via_profile(
         })
         .limit(1);
 
-    let resp = match tokio::time::timeout(Duration::from_millis(2000), rest_client.query(&[filter]))
-        .await
+    let resp = match tokio::time::timeout(
+        settings::get().lib.author_gate_lookup_timeout_ms,
+        rest_client.query(&[filter]),
+    )
+    .await
     {
         Ok(Ok(v)) => v,
         _ => return false, // timeout or error — fail closed
@@ -921,38 +926,36 @@ async fn check_sibling_via_profile(
     false
 }
 
-/// Observer frames are published at a global rate of AT MOST ONE relay frame
-/// per tick — not one per channel, and not one per drain. Everything that
-/// accumulates between ticks waits in [`ObserverPublishQueue`] as events and
-/// is packed greedily into that single frame. One update per second is smooth
-/// enough for a human watching the session viewer, and the global budget is
-/// what makes the relay cost model flat: observer frames bill the agent's
-/// `LimitType::Messages` quota (`agent_standard_messages_per_min` = 120,
-/// enforced in relay `connection.rs::enforce_ws_admission`), shared with the
-/// agent's real chat messages. At 1 frame/s telemetry spends at most 60/min —
-/// half that budget — regardless of how many channels are active. A slower
-/// tick (e.g. 2s → 30/min) would leave more quota headroom for chat at the
-/// price of doubled viewer latency; this constant is the knob.
-const OBSERVER_PUBLISH_TICK: Duration = Duration::from_secs(1);
+// Observer frames are published at a global rate of AT MOST ONE relay frame
+// per tick — not one per channel, and not one per drain. Everything that
+// accumulates between ticks waits in [`ObserverPublishQueue`] as events and
+// is packed greedily into that single frame. One update per second is smooth
+// enough for a human watching the session viewer, and the global budget is
+// what makes the relay cost model flat: observer frames bill the agent's
+// `LimitType::Messages` quota (`agent_standard_messages_per_min` = 120,
+// enforced in relay `connection.rs::enforce_ws_admission`), shared with the
+// agent's real chat messages. At 1 frame/s telemetry spends at most 60/min —
+// half that budget — regardless of how many channels are active. A slower
+// tick (e.g. 2s → 30/min) would leave more quota headroom for chat at the
+// price of doubled viewer latency; `lib.observer_publish_tick_secs` is the knob.
 
-/// Byte budget for EVERYTHING retained while awaiting a publish slot: the
-/// event FIFO (serialized, post-`fit_observer_event_to_budget` bytes) PLUS
-/// the chunk coalescer's pending buffer (serialized event skeletons + raw
-/// accumulated text). Both stores count against this one cap — a
-/// high-cardinality chunk flood (many distinct coalescer keys) is bounded
-/// exactly like a plain event flood; neither buffer is a bypass around the
-/// other. Lossless-ness is bounded by this budget: each publish slot packs
-/// one ~64KB frame, gathered queue-wide for the front channel, so a single
-/// channel drains at ~64KB/s and 4 MiB buys roughly **64 seconds** of
-/// sustained over-production before the oldest items are dropped WITH
-/// accounting (a warn carrying the dropped-event count). With C channels
-/// producing concurrently the slots round-robin between them, so the
-/// per-channel drain is ~64KB/Cs and the budget shortens accordingly —
-/// still bytes-per-slot, never events-per-slot (see
-/// [`ObserverPublishQueue::next_frame`]). Beyond-budget floods therefore
-/// degrade to designed, visible loss — strictly better than the
-/// pre-batching pacer's silent 90/min drop.
-const OBSERVER_PENDING_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+// Byte budget for EVERYTHING retained while awaiting a publish slot: the
+// event FIFO (serialized, post-`fit_observer_event_to_budget` bytes) PLUS
+// the chunk coalescer's pending buffer (serialized event skeletons + raw
+// accumulated text). Both stores count against this one cap — a
+// high-cardinality chunk flood (many distinct coalescer keys) is bounded
+// exactly like a plain event flood; neither buffer is a bypass around the
+// other. Lossless-ness is bounded by this budget: each publish slot packs
+// one ~64KB frame, gathered queue-wide for the front channel, so a single
+// channel drains at ~64KB/s and 4 MiB buys roughly **64 seconds** of
+// sustained over-production before the oldest items are dropped WITH
+// accounting (a warn carrying the dropped-event count). With C channels
+// producing concurrently the slots round-robin between them, so the
+// per-channel drain is ~64KB/Cs and the budget shortens accordingly —
+// still bytes-per-slot, never events-per-slot (see
+// [`ObserverPublishQueue::next_frame`]). Beyond-budget floods therefore
+// degrade to designed, visible loss — strictly better than the
+// pre-batching pacer's silent 90/min drop.
 
 /// Observer event kind for a batch envelope wrapping multiple events.
 ///
@@ -973,7 +976,7 @@ const OBSERVER_BATCH_KIND: &str = "batch";
 /// one frame at publish time ([`Self::next_frame`]), so a backlog keeps
 /// compacting into full frames instead of freezing into a frame queue.
 ///
-/// The queue is bounded by [`OBSERVER_PENDING_QUEUE_MAX_BYTES`]. When a
+/// The queue is bounded by `lib.observer_pending_queue_max_bytes`. When a
 /// sustained flood outruns the one-frame-per-tick drain for longer than the
 /// budget, the OLDEST events are dropped (the viewer wants recent state) with
 /// accounting: a warning carrying the dropped-event count, and
@@ -1027,7 +1030,7 @@ impl ObserverPublishQueue {
         self.pending_bytes + self.coalescer.pending_bytes
     }
 
-    /// Enforce [`OBSERVER_PENDING_QUEUE_MAX_BYTES`] over the total, dropping
+    /// Enforce `lib.observer_pending_queue_max_bytes` over the total, dropping
     /// OLDEST items first with accounting in SOURCE-event units. Global age
     /// order across the two stores is structural: every enqueue path flushes
     /// the coalescer first, so every pending coalescer entry is strictly newer
@@ -1036,7 +1039,7 @@ impl ObserverPublishQueue {
     /// fitted event or pre-flush-capped chunk entry is far under the budget).
     fn enforce_byte_budget(&mut self) {
         let mut dropped = 0u64;
-        while self.total_pending_bytes() > OBSERVER_PENDING_QUEUE_MAX_BYTES
+        while self.total_pending_bytes() > settings::get().lib.observer_pending_queue_max_bytes
             && self.events.len() + self.coalescer.pending.len() > 1
         {
             if let Some((bytes, source_events, _)) = self.events.pop_front() {
@@ -1209,8 +1212,8 @@ async fn run_relay_observer_publisher(
     // 1,000-event replay buffer on reconnect) cannot burst at t=0 — the old
     // pacer's explicit "no initial burst" property, restored.
     let mut publish_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + OBSERVER_PUBLISH_TICK,
-        OBSERVER_PUBLISH_TICK,
+        tokio::time::Instant::now() + settings::get().lib.observer_publish_tick_secs,
+        settings::get().lib.observer_publish_tick_secs,
     );
     publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut closed = false;
@@ -1258,7 +1261,7 @@ struct ObserverChunkCoalescer {
     pending: Vec<PendingObserverChunk>,
     /// Approximate serialized bytes retained in `pending` (each entry's
     /// serialized skeleton at creation plus appended chunk text). Counted
-    /// against [`OBSERVER_PENDING_QUEUE_MAX_BYTES`] by the owning
+    /// against `lib.observer_pending_queue_max_bytes` by the owning
     /// [`ObserverPublishQueue`] so this buffer can never grow outside the
     /// queue's byte budget (a distinct-key chunk flood parks everything here
     /// and nothing would otherwise bound it).
@@ -1287,13 +1290,12 @@ struct ObserverChunkKey {
     agent_index: Option<usize>,
 }
 
-/// Flush coalesced chunks before they exceed the NIP-44 plaintext limit (65,535 bytes).
-/// Leave headroom for the JSON envelope wrapping the text. This is a SOFT pre-flush
-/// of raw text below the hard cap; `fit_observer_event_to_budget` (the final ceiling,
-/// keyed to `OBSERVER_MAX_PLAINTEXT_LEN` in buzz-core/observer.rs:25) is what actually
-/// guarantees the serialized frame fits. Edit one of these two and review the other.
-const OBSERVER_CHUNK_MAX_TEXT_BYTES: usize = 60_000;
-
+// `lib.observer_chunk_max_text_bytes` flushes coalesced chunks before they exceed the
+// NIP-44 plaintext limit (65,535 bytes), leaving headroom for the JSON envelope. This is
+// a SOFT pre-flush of raw text below the hard cap; `fit_observer_event_to_budget` (the
+// final ceiling, keyed to `OBSERVER_MAX_PLAINTEXT_LEN` in buzz-core/observer.rs:25) is
+// what actually guarantees the serialized frame fits. Edit one of these two and review
+// the other.
 impl ObserverChunkCoalescer {
     /// Returns immediately-publishable events, each paired with the number of
     /// SOURCE observer events it represents (merged chunks carry the count of
@@ -1307,7 +1309,8 @@ impl ObserverChunkCoalescer {
 
         if let Some(pending) = self.pending.iter_mut().find(|pending| pending.key == key) {
             // Flush before appending if this would exceed the plaintext size limit.
-            if pending.text.len() + text.len() >= OBSERVER_CHUNK_MAX_TEXT_BYTES {
+            if pending.text.len() + text.len() >= settings::get().lib.observer_chunk_max_text_bytes
+            {
                 let events = self.flush();
                 // Start a new pending entry with the current chunk.
                 self.push_pending(key, event, text);
@@ -1418,11 +1421,10 @@ fn set_observer_chunk_text(payload: &mut serde_json::Value, text: String) {
     }
 }
 
-/// Bytes of head and tail to retain from an elided string leaf — the value
-/// shown to the renderer at each end. The ONLY tuning knob here: large enough
-/// that a clipped diff/tool-result still shows real content, small enough that
-/// eliding actually shrinks the frame.
-const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
+// `lib.observer_leaf_retain_bytes`: bytes of head and tail to retain from an elided
+// string leaf — the value shown to the renderer at each end. The ONLY tuning knob
+// here: large enough that a clipped diff/tool-result still shows real content, small
+// enough that eliding actually shrinks the frame.
 
 /// Trim an oversized observer telemetry frame so its SERIALIZED form fits under
 /// `OBSERVER_MAX_PLAINTEXT_LEN`, instead of dropping the whole frame (silent
@@ -1561,8 +1563,9 @@ fn elision_marker(removed_bytes: usize) -> String {
 /// never split a multi-byte char. Returns `(head_end, tail_start)` with
 /// `head_end <= tail_start`.
 fn elision_boundaries(s: &str) -> (usize, usize) {
-    let head_end = floor_char_boundary(s, OBSERVER_LEAF_RETAIN_BYTES.min(s.len()));
-    let tail_start = ceil_char_boundary(s, s.len().saturating_sub(OBSERVER_LEAF_RETAIN_BYTES));
+    let retain = settings::get().lib.observer_leaf_retain_bytes;
+    let head_end = floor_char_boundary(s, retain.min(s.len()));
+    let tail_start = ceil_char_boundary(s, s.len().saturating_sub(retain));
     (head_end, tail_start.max(head_end))
 }
 
@@ -1622,9 +1625,6 @@ async fn publish_relay_observer_event(
     }
 }
 
-/// Maximum age (seconds) for an observer control frame to be considered fresh.
-const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
-
 fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
@@ -1649,10 +1649,15 @@ fn handle_relay_observer_control_event(
         return;
     }
 
-    // Freshness: reject stale/replayed frames outside ±5 minute window.
+    // Freshness: reject stale/replayed frames outside the freshness window.
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).unsigned_abs() > OBSERVER_CONTROL_FRESHNESS_SECS as u64 {
+    if (event_ts - now).unsigned_abs()
+        > settings::get()
+            .lib
+            .observer_control_freshness_secs
+            .as_secs()
+    {
         tracing::warn!(
             event_ts,
             now,
@@ -1792,7 +1797,9 @@ fn build_project_owner_announcement_events(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let created_at = template.created_at.unwrap_or(now);
-            if created_at > now.saturating_add(300) {
+            if created_at
+                > now.saturating_add(settings::get().lib.project_announce_skew_secs.as_secs())
+            {
                 anyhow::bail!("project announcement timestamp is too far in the future");
             }
             nostr::EventBuilder::new(nostr::Kind::Custom(template.kind), template.content)
@@ -1970,23 +1977,12 @@ fn handle_switch_model_control(
     }
 }
 
-/// Maximum crashes in a 60-second window before a slot's circuit opens.
-const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
-/// Window for circuit-breaker crash counting.
-const CIRCUIT_BREAKER_WINDOW: Duration = Duration::from_secs(60);
-/// Cooldown before a tripped circuit breaker allows a probe respawn.
-const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
-/// Base backoff delay for respawn (doubles per recent crash, capped at 30s).
-const RESPAWN_BASE_DELAY: Duration = Duration::from_secs(1);
-/// Maximum respawn backoff delay.
-const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
-
 /// Per-slot circuit breaker state.
 ///
-/// `crash_times` holds timestamps of recent crashes within `CIRCUIT_BREAKER_WINDOW`.
+/// `crash_times` holds timestamps of recent crashes within `lib.circuit_breaker_window_secs`.
 /// `open_until` is set when the threshold is hit; the circuit stays open until that
 /// instant, then allows one probe respawn (half-open). If the probe crashes, the
-/// circuit re-opens for another `CIRCUIT_BREAKER_COOLDOWN` period.
+/// circuit re-opens for another `lib.circuit_breaker_cooldown_secs` period.
 ///
 /// All state transitions go through methods on this struct — callers never
 /// manipulate `crash_times` or `open_until` directly.
@@ -2018,6 +2014,7 @@ impl SlotCircuit {
     /// Called by `respawn_agent_into`, `recover_panicked_agent`, and slot refill.
     fn record_crash(&mut self) -> CrashVerdict {
         let now = std::time::Instant::now();
+        let lib = &settings::get().lib;
 
         // Half-open: cooldown elapsed → allow one probe.
         if let Some(open_until) = self.open_until {
@@ -2027,7 +2024,7 @@ impl SlotCircuit {
                 // immediately and the circuit re-opens. This implements a
                 // "prove stability for one full window" policy.
                 self.crash_times.clear();
-                for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+                for _ in 0..(lib.circuit_breaker_threshold - 1) {
                     self.crash_times.push(now);
                 }
                 self.open_until = None;
@@ -2040,24 +2037,26 @@ impl SlotCircuit {
         // Record this crash and prune old entries.
         self.crash_times.push(now);
         self.crash_times
-            .retain(|&t| now.duration_since(t) < CIRCUIT_BREAKER_WINDOW);
+            .retain(|&t| now.duration_since(t) < lib.circuit_breaker_window_secs);
 
         let recent = self.crash_times.len();
 
-        if recent >= CIRCUIT_BREAKER_THRESHOLD {
-            self.open_until = Some(now + CIRCUIT_BREAKER_COOLDOWN);
+        if recent >= lib.circuit_breaker_threshold {
+            self.open_until = Some(now + lib.circuit_breaker_cooldown_secs);
             return CrashVerdict::CircuitOpen;
         }
 
-        // Exponential backoff: 1s * 2^(recent-1), capped at 30s, with ±20% jitter.
-        let base = RESPAWN_BASE_DELAY.saturating_mul(1u32 << (recent - 1).min(5));
-        let capped = base.min(RESPAWN_MAX_DELAY);
+        // Exponential backoff: base * 2^(recent-1), capped, with jitter.
+        let base = lib
+            .respawn_base_delay_secs
+            .saturating_mul(1u32 << (recent - 1).min(lib.respawn_exp_cap as usize));
+        let capped = base.min(lib.respawn_max_delay_secs);
         let jitter = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as f64)
             / 1_000_000_000.0; // 0.0..1.0
-        let factor = 0.8 + jitter * 0.4; // 0.8..1.2
+        let factor = (1.0 - lib.jitter_fraction) + jitter * 2.0 * lib.jitter_fraction;
         CrashVerdict::Respawn(capped.mul_f64(factor))
     }
 
@@ -2065,7 +2064,8 @@ impl SlotCircuit {
     /// on every heartbeat tick. Uses fresh `Instant::now()` so spawn latency
     /// doesn't shorten the effective cooldown.
     fn mark_spawn_failed(&mut self) {
-        self.open_until = Some(std::time::Instant::now() + CIRCUIT_BREAKER_COOLDOWN);
+        self.open_until =
+            Some(std::time::Instant::now() + settings::get().lib.circuit_breaker_cooldown_secs);
     }
 
     /// Check if an empty slot can be refilled. Unlike `record_crash`, this
@@ -2078,12 +2078,13 @@ impl SlotCircuit {
     /// can still trip if the refilled agent crashes quickly.
     fn can_refill(&mut self) -> bool {
         let now = std::time::Instant::now();
+        let lib = &settings::get().lib;
         match self.open_until {
             Some(open_until) => {
                 if now >= open_until {
                     // Half-open probe: pre-seed crash_times.
                     self.crash_times.clear();
-                    for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+                    for _ in 0..(lib.circuit_breaker_threshold - 1) {
                         self.crash_times.push(now);
                     }
                     self.open_until = None;
@@ -2239,6 +2240,7 @@ mod inactivity_tests {
 
     #[test]
     fn zero_disables_expiry_and_in_flight_turns_defer_it() {
+        crate::settings::init_for_tests();
         let started = tokio::time::Instant::now();
         let after_bound = started + Duration::from_secs(61);
 
@@ -2264,6 +2266,7 @@ mod inactivity_tests {
 
     #[test]
     fn dispatched_activity_restarts_the_inactivity_bound() {
+        crate::settings::init_for_tests();
         let started = tokio::time::Instant::now();
         let dispatched = started + Duration::from_secs(50);
         let checked = started + Duration::from_secs(61);
@@ -2294,6 +2297,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn sleeps_when_ready_idle_and_quiet() {
+        crate::settings::init_for_tests();
         let (last, now, bound) = ready_after_bound();
         assert!(idle_pool_sleep_due(
             true, last, now, bound, false, false, false, false
@@ -2302,6 +2306,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn zero_bound_never_sleeps() {
+        crate::settings::init_for_tests();
         let (last, now, _) = ready_after_bound();
         assert!(!idle_pool_sleep_due(
             true,
@@ -2317,6 +2322,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn not_ready_never_sleeps() {
+        crate::settings::init_for_tests();
         // A still-sleeping (or waking) pool must not "re-sleep".
         let (last, now, bound) = ready_after_bound();
         assert!(!idle_pool_sleep_due(
@@ -2326,6 +2332,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn active_turn_defers_sleep() {
+        crate::settings::init_for_tests();
         let (last, now, bound) = ready_after_bound();
         assert!(!idle_pool_sleep_due(
             true, last, now, bound, true, false, false, false
@@ -2334,6 +2341,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn in_flight_prompt_task_defers_sleep() {
+        crate::settings::init_for_tests();
         let (last, now, bound) = ready_after_bound();
         assert!(!idle_pool_sleep_due(
             true, last, now, bound, false, true, false, false
@@ -2342,6 +2350,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn queued_work_at_boundary_defers_sleep() {
+        crate::settings::init_for_tests();
         // Enqueue-at-teardown protection: a batch sitting in the queue blocks
         // teardown so it is never stranded — the loop dispatches it instead.
         let (last, now, bound) = ready_after_bound();
@@ -2352,6 +2361,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn wake_or_respawn_in_flight_defers_sleep() {
+        crate::settings::init_for_tests();
         let (last, now, bound) = ready_after_bound();
         assert!(!idle_pool_sleep_due(
             true, last, now, bound, false, false, false, true
@@ -2360,6 +2370,7 @@ mod idle_pool_sleep_tests {
 
     #[test]
     fn recent_activity_defers_sleep() {
+        crate::settings::init_for_tests();
         // Activity 50s ago under a 60s bound: not yet idle.
         let started = tokio::time::Instant::now();
         let recent = started + Duration::from_secs(50);
@@ -2393,6 +2404,7 @@ mod idle_pool_sleep_tests {
     // authoritative signal clears per-slot when the payload is received.
     #[test]
     fn respawn_in_flight_signal_gates_then_clears_for_sleep() {
+        crate::settings::init_for_tests();
         let (last, now, bound) = ready_after_bound();
 
         // A respawn in flight for any slot defers sleep.
@@ -2432,6 +2444,7 @@ mod idle_pool_sleep_tests {
     // ever reintroduces it as the gate signal.
     #[tokio::test]
     async fn completed_respawn_tasks_are_reaped_from_the_joinset() {
+        crate::settings::init_for_tests();
         let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         respawn_tasks.spawn(async {});
         respawn_tasks.spawn(async {});
@@ -2450,59 +2463,70 @@ mod idle_pool_sleep_tests {
     }
 }
 
-/// Oldest a caller-supplied replay floor may reach back from startup. Bounds
-/// the stale-event burst when a spawn request sat around (e.g. the desktop
-/// slept between the send and this spawn actually running).
-const REPLAY_FLOOR_MAX_AGE_SECS: u64 = 15 * 60;
-
 /// Resolve the startup watermark from process-start time and an optional
 /// replay floor (`--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR`).
 ///
 /// A publish-first mention send publishes the triggering message BEFORE this
 /// harness spawns, so the watermark must reach back to the send timestamp for
 /// the first REQ (`since = watermark − 5s`) to replay that message. Floors
-/// older than [`REPLAY_FLOOR_MAX_AGE_SECS`] clamp to that bound; floors in
+/// older than `lib.replay_floor_max_age_secs` (bounding the stale-event burst when
+/// a spawn request sat around) clamp to that bound; floors in
 /// the future clamp to `now` (a skewed sender must not push the watermark
 /// forward past startup and re-open the blind spot the watermark closes).
 fn startup_watermark_with_floor(now_unix: u64, replay_floor: Option<u64>) -> u64 {
     match replay_floor {
-        Some(floor) => floor.clamp(now_unix.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS), now_unix),
+        Some(floor) => {
+            let max_age = settings::get().lib.replay_floor_max_age_secs.as_secs();
+            floor.clamp(now_unix.saturating_sub(max_age), now_unix)
+        }
         None => now_unix,
     }
 }
 
 #[cfg(test)]
 mod replay_floor_tests {
-    use super::{startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+    use super::startup_watermark_with_floor;
+
+    fn max_age() -> u64 {
+        crate::settings::get()
+            .lib
+            .replay_floor_max_age_secs
+            .as_secs()
+    }
 
     const NOW: u64 = 1_700_000_000;
 
     #[test]
     fn no_floor_keeps_startup_time() {
+        crate::settings::init_for_tests();
         assert_eq!(startup_watermark_with_floor(NOW, None), NOW);
     }
 
     #[test]
     fn recent_floor_moves_watermark_back_to_the_send_timestamp() {
+        crate::settings::init_for_tests();
         // The publish-first case: message sent 4s before the harness booted.
         assert_eq!(startup_watermark_with_floor(NOW, Some(NOW - 4)), NOW - 4);
     }
 
     #[test]
     fn stale_floor_clamps_to_the_max_age_bound() {
+        crate::settings::init_for_tests();
         assert_eq!(
-            startup_watermark_with_floor(NOW, Some(NOW - REPLAY_FLOOR_MAX_AGE_SECS - 1)),
-            NOW - REPLAY_FLOOR_MAX_AGE_SECS
+            startup_watermark_with_floor(NOW, Some(NOW - max_age() - 1)),
+            NOW - max_age()
         );
     }
 
     #[test]
     fn future_floor_is_ignored() {
+        crate::settings::init_for_tests();
         assert_eq!(startup_watermark_with_floor(NOW, Some(NOW + 60)), NOW);
     }
 
     #[test]
     fn early_epoch_now_does_not_underflow() {
+        crate::settings::init_for_tests();
         assert_eq!(startup_watermark_with_floor(10, Some(0)), 0);
     }
 }
@@ -2523,7 +2547,11 @@ pub fn run() -> Result<()> {
         let code = runtime.block_on(run_task::run());
         // stdin/file reads can leave a blocking worker pending (for example an
         // open pipe). Bound runtime shutdown; process exit retires those workers.
-        runtime.shutdown_timeout(Duration::from_millis(100));
+        // Settings are absent when run_task failed before loading them.
+        match settings::try_get() {
+            Some(settings) => runtime.shutdown_timeout(settings.lib.run_shutdown_timeout_ms),
+            None => runtime.shutdown_background(),
+        }
         std::process::exit(code);
     }
     tokio_main()
@@ -2544,6 +2572,7 @@ async fn tokio_main() -> Result<()> {
             .map(|(_, a)| a)
             .collect();
         let args = ModelsArgs::parse_from(&filtered);
+        settings::init_from(args.agent.settings_file.as_deref())?;
         return run_models(args).await;
     }
 
@@ -2554,6 +2583,7 @@ async fn tokio_main() -> Result<()> {
             .map(|(_, a)| a)
             .collect();
         let args = AuthMethodsArgs::parse_from(&filtered);
+        settings::init_from(args.agent.settings_file.as_deref())?;
         return run_auth_methods(args).await;
     }
 
@@ -2564,6 +2594,7 @@ async fn tokio_main() -> Result<()> {
             .map(|(_, a)| a)
             .collect();
         let args = AuthenticateArgs::parse_from(&filtered);
+        settings::init_from(args.agent.settings_file.as_deref())?;
         return run_authenticate(args).await;
     }
 
@@ -2577,7 +2608,16 @@ async fn tokio_main() -> Result<()> {
         .compact()
         .init();
 
-    let config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    let mut args = config::CliArgs::parse();
+    settings::init_from(args.settings_file.as_deref())?;
+    let goal = goal::GoalRuntime::build(
+        settings::get().goal.as_ref(),
+        args.multica_api_key.take(),
+        args.classifier_key.take(),
+    )
+    .await?;
+    let config =
+        Config::from_args(args).map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -2615,7 +2655,7 @@ async fn tokio_main() -> Result<()> {
         let _ = tx.send(());
     });
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
-    let harness = run_harness(config, shutdown_tx, shutdown_rx.clone(), ready_tx);
+    let harness = run_harness(config, goal, shutdown_tx, shutdown_rx.clone(), ready_tx);
     tokio::pin!(harness);
     let result = tokio::select! {
         biased;
@@ -2629,6 +2669,7 @@ async fn tokio_main() -> Result<()> {
 
 async fn run_harness(
     config: Config,
+    goal: Option<Arc<goal::GoalRuntime>>,
     shutdown_tx: watch::Sender<()>,
     mut shutdown_rx: watch::Receiver<()>,
     startup_ready: tokio::sync::oneshot::Sender<()>,
@@ -2851,11 +2892,22 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
+    let (continuation_tx, mut continuation_rx) = mpsc::unbounded_channel::<scope::SessionScope>();
+    let mut prompt_context = runtime.prompt_context(
         relay.rest_client(),
         channel_info_map,
         SessionMode::Conversation,
-    )?);
+    )?;
+    prompt_context.goal = goal;
+    prompt_context.continuation_tx = Some(continuation_tx);
+    let ctx = Arc::new(prompt_context);
+
+    let (sweep_tx, mut sweep_rx) = mpsc::channel::<(relay::BuzzEvent, multica::IssueRef)>(
+        settings::get().relay.event_channel_capacity_default,
+    );
+    if let Some(goal) = ctx.goal.clone() {
+        issue_sweep::spawn(goal, ctx.rest_client.clone(), sweep_tx);
+    }
 
     if !config.memory_enabled {
         tracing::info!(
@@ -2876,7 +2928,7 @@ async fn run_harness(
     let mut heartbeat_in_flight = false;
 
     let mut presence_heartbeat = if config.presence_enabled {
-        let interval = Duration::from_secs(60);
+        let interval = settings::get().lib.presence_interval_secs;
         Some(tokio::time::interval_at(
             tokio::time::Instant::now() + interval,
             interval,
@@ -2886,7 +2938,7 @@ async fn run_harness(
     };
 
     let mut typing_refresh = if config.typing_enabled {
-        let interval = Duration::from_secs(3);
+        let interval = settings::get().lib.typing_refresh_secs;
         Some(tokio::time::interval_at(
             tokio::time::Instant::now() + interval,
             interval,
@@ -2905,7 +2957,7 @@ async fn run_harness(
     let mut inactivity_reaper = if inactivity_bound.is_zero() {
         None
     } else {
-        let interval = inactivity_bound.min(Duration::from_secs(30));
+        let interval = inactivity_bound.min(settings::get().lib.inactivity_tick_max_secs);
         Some(tokio::time::interval_at(
             tokio::time::Instant::now() + interval,
             interval,
@@ -2926,7 +2978,7 @@ async fn run_harness(
     let mut idle_pool_sleep_reaper = if idle_pool_sleep_bound.is_zero() {
         None
     } else {
-        let interval = idle_pool_sleep_bound.min(Duration::from_secs(30));
+        let interval = idle_pool_sleep_bound.min(settings::get().lib.idle_pool_tick_max_secs);
         Some(tokio::time::interval_at(
             tokio::time::Instant::now() + interval,
             interval,
@@ -2936,7 +2988,7 @@ async fn run_harness(
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
-    let maintenance_interval = Duration::from_secs(30);
+    let maintenance_interval = settings::get().lib.maintenance_interval_secs;
     let mut last_maintenance = std::time::Instant::now();
 
     // Channel for background respawn tasks to return completed agents.
@@ -2972,7 +3024,7 @@ async fn run_harness(
     // replays that share the same timestamp.
     let mut membership_newest_ts: HashMap<Uuid, u64> = HashMap::new();
     // Two-generation dedup for membership event replays (bounded, no amnesia).
-    // Rotates at 1000 entries instead of clearing the entire set at 2000.
+    // Rotates at the cap instead of clearing the entire set at twice that.
     let mut seen_membership_current: HashSet<String> = HashSet::new();
     let mut seen_membership_previous: HashSet<String> = HashSet::new();
 
@@ -2996,7 +3048,7 @@ async fn run_harness(
 
     //
     // One SlotCircuit per agent slot. crash_times entries are pruned to the last
-    // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
+    // lib.circuit_breaker_window_secs on each respawn attempt. The Vec is indexed by
     // agent slot index, so it must be sized to the configured pool capacity
     // (not the live count, which may be smaller after partial startup).
     let mut crash_history: Vec<SlotCircuit> = (0..config.agents as usize)
@@ -3125,7 +3177,8 @@ async fn run_harness(
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
-        let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
+        let hold_deadline =
+            pool.next_hold_deadline(settings::get().pool.hold_busy_owner_timeout_secs);
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -3159,6 +3212,12 @@ async fn run_harness(
                 // locked semantics (Eva + Max + Perci).
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
+                }
+                // A guard continuation is starting: the turn is still working, so
+                // its in-flight deadline restarts.
+                Some(scope) = continuation_rx.recv() => {
+                    queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
+                    None
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
@@ -3227,6 +3286,40 @@ async fn run_harness(
                     }
                     None
                 }
+                // RECONCILE: an open issue with no agent on it starts one through
+                // the normal dispatch. Not an intake event.
+                Some((event, issue)) = sweep_rx.recv() => {
+                    let _ = result_rx;
+                    let is_dm = is_dm_channel(event.channel_id, &ctx.channel_info).await;
+                    let scope = scope::SessionScope::derive(
+                        config.session_policy,
+                        event.channel_id,
+                        is_dm,
+                        &event.event,
+                    );
+                    if !(queue.is_scope_in_flight(&scope) || queue.has_pending_scope(&scope)) {
+                        let prompt_tag = ctx.goal.as_ref()
+                            .map(|goal| goal.settings.multica.reconcile_prompt_tag.clone())
+                            .unwrap_or_default();
+                        queue.push(QueuedEvent {
+                            channel_id: event.channel_id,
+                            scope,
+                            event: event.event,
+                            received_at: std::time::Instant::now(),
+                            prompt_tag,
+                            edit: None,
+                            issue: Some(issue),
+                        });
+                        if pool_ready {
+                            for (scope, thread_tags) in
+                                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
+                            {
+                                typing_channels.insert(scope, thread_tags);
+                            }
+                        }
+                    }
+                    None
+                }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 buzz_event = relay.next_event() => {
                     let _ = result_rx; // end split borrow before relay handling
@@ -3267,8 +3360,10 @@ async fn run_harness(
                                     continue;
                                 }
                                 seen_membership_current.insert(eid);
-                                // Rotate at 1000: current → previous, no amnesia window.
-                                if seen_membership_current.len() >= 1000 {
+                                // Rotate at the cap: current → previous, no amnesia window.
+                                if seen_membership_current.len()
+                                    >= settings::get().lib.membership_seen_rotate
+                                {
                                     seen_membership_previous =
                                         std::mem::take(&mut seen_membership_current);
                                 }
@@ -3334,9 +3429,10 @@ async fn run_harness(
                                     if !drained_ids.is_empty() {
                                         let rc = ctx.rest_client.clone();
                                         let ids = drained_ids.clone();
+                                        let seen = settings::get().pool.reaction_seen.clone();
                                         tokio::spawn(async move {
                                             for eid in &ids {
-                                                pool::reaction_remove(&rc, eid, "👀").await;
+                                                pool::reaction_remove(&rc, eid, &seen).await;
                                             }
                                         });
                                     }
@@ -3361,7 +3457,7 @@ async fn run_harness(
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
                                 kind_u32,
-                                "!shutdown",
+                                &settings::get().lib.owner_command_shutdown,
                                 &pubkey_hex,
                             );
                             if is_shutdown {
@@ -3392,7 +3488,7 @@ async fn run_harness(
                             let is_cancel = is_owner_control_command(
                                 &buzz_event.event,
                                 kind_u32,
-                                "!cancel",
+                                &settings::get().lib.owner_command_cancel,
                                 &pubkey_hex,
                             );
                             if is_cancel {
@@ -3445,7 +3541,7 @@ async fn run_harness(
                             let is_rotate = is_owner_control_command(
                                 &buzz_event.event,
                                 kind_u32,
-                                "!rotate",
+                                &settings::get().lib.owner_command_rotate,
                                 &pubkey_hex,
                             );
                             if is_rotate {
@@ -3546,6 +3642,28 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
+                            // INTAKE 3: classify. An ask is queued and answered.
+                            // A task is queued on this session so the agent
+                            // names it before Multica create.
+                            if let Some(goal) = ctx.goal.as_deref() {
+                                let intake_event = queue::BatchEvent {
+                                    event: ingress.buzz_event.event.clone(),
+                                    prompt_tag: ingress.prompt_tag.clone(),
+                                    received_at: std::time::Instant::now(),
+                                    edit: ingress.edit.clone(),
+                                    issue: None,
+                                };
+                                if goal::intake(
+                                    goal,
+                                    &ctx,
+                                    ingress.buzz_event.channel_id,
+                                    &intake_event,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                            }
                             let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -3576,7 +3694,7 @@ async fn run_harness(
                             tracing::warn!("relay event stream ended — requesting reconnect");
                             if let Err(e) = relay.reconnect().await {
                                 tracing::error!("relay background task is gone: {e} — exiting");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                tokio::time::sleep(settings::get().lib.relay_gone_exit_delay_secs).await;
                                 break;
                             }
                         }
@@ -4080,7 +4198,7 @@ async fn run_harness(
     // just as promptly. Timeout is a backstop for a slot stuck outside the
     // select (e.g. in spawn); only then do we fall back to aborting.
     let _ = shutdown_tx.send(());
-    let wake_drain = tokio::time::timeout(Duration::from_secs(30), async {
+    let wake_drain = tokio::time::timeout(settings::get().lib.shutdown_wake_drain_secs, async {
         while wake_tasks.join_next().await.is_some() {}
     })
     .await;
@@ -4095,9 +4213,9 @@ async fn run_harness(
     }
 
     tracing::info!("shutdown: waiting for in-flight prompts");
-    // 30 s is generous for in-flight prompts to be cancelled; using
+    // The grace is generous for in-flight prompts to be cancelled; using
     // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
-    let grace = Duration::from_secs(30);
+    let grace = settings::get().lib.shutdown_grace_secs;
     // Best-effort drain of both join_set and result_rx during the grace period.
     // Tasks that finish normally send their OwnedAgent through result_rx — we
     // explicitly shut them down here to reap child processes. If the grace
@@ -4171,7 +4289,7 @@ async fn run_harness(
     // Best-effort: set presence to offline before exiting.
     if config.presence_enabled {
         match tokio::time::timeout(
-            Duration::from_secs(2),
+            settings::get().lib.offline_presence_timeout_secs,
             publish_presence(&presence_publisher, &presence_keys, "offline"),
         )
         .await
@@ -4600,6 +4718,7 @@ mod try_native_steer_fallback_log_tests {
                 event: event.clone(),
                 received_at: std::time::Instant::now(),
                 prompt_tag: "mention".into(),
+                issue: None,
                 edit: None,
             }),
             "queued event must be accepted before the steer attempt"
@@ -4615,6 +4734,7 @@ mod try_native_steer_fallback_log_tests {
                 queue::BatchEvent {
                     event,
                     prompt_tag: "mention".into(),
+                    issue: None,
                     received_at: std::time::Instant::now(),
                     edit: None,
                 },
@@ -4668,6 +4788,7 @@ mod try_native_steer_fallback_log_tests {
     /// `PromptCompleted`, classified as `task_absent`.
     #[test]
     fn try_native_steer_logs_task_absent_reason_and_keeps_fallback() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let (returned, logs) = try_native_steer_capturing(&mut pool);
         assert!(
@@ -4680,6 +4801,7 @@ mod try_native_steer_fallback_log_tests {
     /// The in-flight task has no steer sender installed: `sender_absent`.
     #[tokio::test]
     async fn try_native_steer_logs_sender_absent_reason_and_keeps_fallback() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         mark_in_flight_with_steer_tx(&mut pool, steer_scope(), None);
         let (returned, logs) = try_native_steer_capturing(&mut pool);
@@ -4694,6 +4816,7 @@ mod try_native_steer_fallback_log_tests {
     /// `mailbox_full`.
     #[tokio::test]
     async fn try_native_steer_logs_mailbox_full_reason_and_keeps_fallback() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let (tx, _rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
         mark_in_flight_with_steer_tx(&mut pool, steer_scope(), Some(tx.clone()));
@@ -4714,6 +4837,7 @@ mod try_native_steer_fallback_log_tests {
     /// The read loop's steer receiver is torn down: `mailbox_closed`.
     #[tokio::test]
     async fn try_native_steer_logs_mailbox_closed_reason_and_keeps_fallback() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let (tx, rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
         mark_in_flight_with_steer_tx(&mut pool, steer_scope(), Some(tx));
@@ -4765,8 +4889,11 @@ fn dispatch_pending(
         // so an active channel cannot starve a sibling channel on a shared
         // worker. A held thread that outwaits the window forks a fresh session
         // rather than starve behind an unbounded turn.
-        let forked_after_hold = match pool.hold_decision(&scope, now, pool::HOLD_BUSY_OWNER_TIMEOUT)
-        {
+        let forked_after_hold = match pool.hold_decision(
+            &scope,
+            now,
+            settings::get().pool.hold_busy_owner_timeout_secs,
+        ) {
             pool::HoldDecision::Hold {
                 held_for,
                 owner_index,
@@ -4787,7 +4914,7 @@ fn dispatch_pending(
                             "scope": scope.telemetry_label(),
                             "ownerIndex": owner_index,
                             "heldForSecs": held_for.as_secs_f64(),
-                            "timeoutSecs": pool::HOLD_BUSY_OWNER_TIMEOUT.as_secs_f64(),
+                            "timeoutSecs": settings::get().pool.hold_busy_owner_timeout_secs.as_secs_f64(),
                         }),
                     );
                 }
@@ -5110,9 +5237,9 @@ fn handle_prompt_result(
                     "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
-                let content = format!(
-                    "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                    config.max_turn_duration_secs
+                let content = settings::render(
+                    &settings::get().lib.failure_notice_hard_timeout,
+                    &[("max_turn_secs", &config.max_turn_duration_secs.to_string())],
                 );
                 spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
@@ -5128,9 +5255,9 @@ fn handle_prompt_result(
                     "hard-cap timeout with recent activity — requeueing for retry"
                 );
                 if let Some(dead) = queue.requeue(batch) {
-                    let content = format!(
-                        "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                        config.max_turn_duration_secs
+                    let content = settings::render(
+                        &settings::get().lib.failure_notice_hard_timeout_retries,
+                        &[("max_turn_secs", &config.max_turn_duration_secs.to_string())],
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
@@ -5148,11 +5275,7 @@ fn handle_prompt_result(
                     events = batch.events.len(),
                     "dead-lettering batch immediately — model not found"
                 );
-                let content = "⚠️ I couldn't process the last request: the configured model \
-                    wasn't found at the provider's endpoint. Open agent settings, select a \
-                    different model from the dropdown, and save your changes. Restart the agent \
-                    to apply the new configuration, then re-send your request."
-                    .to_string();
+                let content = settings::get().lib.failure_notice_model_not_found.clone();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
@@ -5164,25 +5287,23 @@ fn handle_prompt_result(
                     events = batch.events.len(),
                     "dead-lettering batch immediately — non-retryable auth error"
                 );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
-                    .to_string();
+                let content = settings::get().lib.failure_notice_auth.clone();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
+                let lib = &settings::get().lib;
                 let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "the turn exceeded the maximum duration".to_string()
+                    PromptOutcome::Timeout(TimeoutKind::Idle) => {
+                        lib.failure_reason_idle_timeout.clone()
                     }
-                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+                        lib.failure_reason_hard_timeout.clone()
+                    }
+                    PromptOutcome::AgentExited => lib.failure_reason_agent_exited.clone(),
                     PromptOutcome::Error(e) => format!("{e}"),
                     PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
-                    _ => "repeated failures".to_string(),
+                    _ => lib.failure_reason_repeated.clone(),
                 };
-                let content = format!(
-                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
-                );
+                let content = settings::render(&lib.failure_notice_generic, &[("reason", &reason)]);
                 spawn_failure_notice(rest_client, &dead, content);
             }
         } else {
@@ -5643,6 +5764,7 @@ fn dispatch_heartbeat(
 mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.starts_with(
             "You are an agent operating inside Buzz — a Nostr-based messaging platform for human-agent collaboration.\nBuzz is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
@@ -5656,6 +5778,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_names_current_context_framing() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("## Incoming Turn Contract"));
         assert!(prompt.contains("`Content:` field in the current `<buzz-event>`"));
@@ -5674,6 +5797,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("pass real newline bytes through stdin"));
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
@@ -5682,6 +5806,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("read its root `AGENTS.md`"));
         assert!(prompt.contains("path-local `AGENTS.md`"));
@@ -5695,6 +5820,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_not_to_duplicate_projects() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("do **not** run `buzz projects create`"));
         assert!(prompt.contains("buzz issues create --channel"));
@@ -5703,6 +5829,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
+        crate::settings::init_for_tests();
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
@@ -5723,20 +5850,9 @@ mod agent_draft_prompt_tests {
 
 fn default_heartbeat_prompt() -> String {
     let now = chrono::Utc::now().to_rfc3339();
-    format!(
-        "[System: Heartbeat]\nTime: {now}\n\n\
-         You have been awakened for a routine heartbeat. You have NO incoming messages or\n\
-         active channel context for this turn.\n\n\
-         Your tasks:\n\
-         1. Run `buzz feed get --types needs_action` to check for pending workflow approvals or\n\
-            high-priority requests addressed to you.\n\
-         2. Run `buzz feed get --types mentions` to check for unanswered @mentions.\n\
-         3. If you find actionable items, address them using the appropriate CLI commands\n\
-            (e.g., `buzz workflows approve --token <UUID>`, `buzz messages send`,\n\
-            `buzz messages send --reply-to <event-id>`).\n\
-         4. If there are no pending actions or mentions, end your turn immediately.\n\n\
-         Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
-         Do not invent work — only act on items surfaced by the feed commands."
+    settings::render(
+        &settings::get().lib.default_heartbeat_prompt,
+        &[("now", &now)],
     )
 }
 
@@ -5847,7 +5963,10 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = tokio::time::timeout(
+                    settings::get().lib.initialize_timeout_secs,
+                    acp.initialize(),
+                );
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -5978,8 +6097,9 @@ async fn spawn_and_init(
 }
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
-    let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
-    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+    let command = agent.resolved_command();
+    let agent_args = config::normalize_agent_args(&command, agent.resolved_args());
+    AcpClient::spawn(&command, &agent_args, &[], false).await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -6000,19 +6120,25 @@ async fn run_auth_methods(args: AuthMethodsArgs) -> Result<()> {
         }
     };
 
-    let init_result = match tokio::time::timeout(MODELS_TIMEOUT, client.initialize()).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            client.shutdown().await;
-            eprintln!("error: agent initialize failed: {e}");
-            std::process::exit(1);
-        }
-        Err(_) => {
-            client.shutdown().await;
-            eprintln!("error: agent timed out ({MODELS_TIMEOUT:?})");
-            std::process::exit(1);
-        }
-    };
+    let init_result =
+        match tokio::time::timeout(settings::get().lib.models_timeout_secs, client.initialize())
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                client.shutdown().await;
+                eprintln!("error: agent initialize failed: {e}");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                client.shutdown().await;
+                eprintln!(
+                    "error: agent timed out ({:?})",
+                    settings::get().lib.models_timeout_secs
+                );
+                std::process::exit(1);
+            }
+        };
 
     let methods = extract_auth_methods(&init_result);
     client.shutdown().await;
@@ -6048,19 +6174,25 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
         }
     };
 
-    let init_result = match tokio::time::timeout(MODELS_TIMEOUT, client.initialize()).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            client.shutdown().await;
-            eprintln!("error: agent initialize failed: {e}");
-            std::process::exit(1);
-        }
-        Err(_) => {
-            client.shutdown().await;
-            eprintln!("error: agent initialize timed out ({MODELS_TIMEOUT:?})");
-            std::process::exit(1);
-        }
-    };
+    let init_result =
+        match tokio::time::timeout(settings::get().lib.models_timeout_secs, client.initialize())
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                client.shutdown().await;
+                eprintln!("error: agent initialize failed: {e}");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                client.shutdown().await;
+                eprintln!(
+                    "error: agent initialize timed out ({:?})",
+                    settings::get().lib.models_timeout_secs
+                );
+                std::process::exit(1);
+            }
+        };
 
     let supports_method = extract_auth_methods(&init_result)
         .iter()
@@ -6074,8 +6206,11 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    let result =
-        tokio::time::timeout(AUTHENTICATE_TIMEOUT, client.authenticate(&args.method_id)).await;
+    let result = tokio::time::timeout(
+        settings::get().lib.authenticate_timeout_secs,
+        client.authenticate(&args.method_id),
+    )
+    .await;
 
     match result {
         Ok(Ok(_)) => {
@@ -6089,7 +6224,10 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
         }
         Err(_) => {
             client.shutdown().await;
-            eprintln!("error: authenticate timed out ({AUTHENTICATE_TIMEOUT:?})");
+            eprintln!(
+                "error: authenticate timed out ({:?})",
+                settings::get().lib.authenticate_timeout_secs
+            );
             std::process::exit(1);
         }
     }
@@ -6100,23 +6238,23 @@ async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
 async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
-    let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
+    let agent_command = args.agent.resolved_command();
+    let agent_args = config::normalize_agent_args(&agent_command, args.agent.resolved_args());
     let cwd = current_working_directory()?;
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
-    let mut client =
-        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: failed to spawn agent: {e}");
-                std::process::exit(1);
-            }
-        };
+    let mut client = match AcpClient::spawn(&agent_command, &agent_args, &[], false).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to spawn agent: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Initialize + session/new under a timeout. Client is owned above,
     // so shutdown() runs on all paths (success, error, timeout).
-    let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
+    let protocol_result = tokio::time::timeout(settings::get().lib.models_timeout_secs, async {
         let init = client.initialize().await?;
         let session = client.session_new_full(&cwd, vec![], None, None).await?;
         Ok::<_, acp::AcpError>((init, session))
@@ -6132,7 +6270,10 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         }
         Err(_) => {
             client.shutdown().await;
-            eprintln!("error: agent timed out ({MODELS_TIMEOUT:?})");
+            eprintln!(
+                "error: agent timed out ({:?})",
+                settings::get().lib.models_timeout_secs
+            );
             std::process::exit(1);
         }
     };
@@ -6242,7 +6383,7 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         name: std::path::Path::new(&config.mcp_command)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
+            .unwrap_or(&settings::get().lib.mcp_name_fallback)
             .to_string(),
         command: config.mcp_command.clone(),
         args: vec![],
@@ -6316,6 +6457,7 @@ mod heartbeat_base_prompt_tests {
 
     #[test]
     fn test_heartbeat_legacy_agent_gets_base_prepended() {
+        crate::settings::init_for_tests();
         // protocol_version 1 + Some(base_prompt): heartbeat prompt is prefixed
         // with the <base> section exactly as the legacy session/new path would.
         let prompt = "[System: Heartbeat]\nrun feed get";
@@ -6328,6 +6470,7 @@ mod heartbeat_base_prompt_tests {
 
     #[test]
     fn test_heartbeat_modern_agent_omits_base() {
+        crate::settings::init_for_tests();
         // protocol_version 2 gets base_prompt via session/new; the heartbeat
         // prompt is sent verbatim.
         let prompt = "[System: Heartbeat]\nrun feed get";
@@ -6355,6 +6498,7 @@ mod owner_control_command_tests {
 
     #[test]
     fn owner_control_command_requires_kind_content_and_agent_mention() {
+        crate::settings::init_for_tests();
         let agent = "ab".repeat(32);
 
         let event = make_event(KIND_STREAM_MESSAGE, " !rotate ", Some(&agent));
@@ -6387,6 +6531,7 @@ mod owner_control_command_tests {
 
     #[test]
     fn mode_gate_signal_maps_handling_to_control_signal() {
+        crate::settings::init_for_tests();
         let owner = "a".repeat(64);
         let other = "b".repeat(64);
 
@@ -6427,6 +6572,7 @@ mod owner_control_command_tests {
 
     #[tokio::test]
     async fn signal_in_flight_task_sends_rotate_once() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
         let other_channel_id = Uuid::new_v4();
@@ -6496,6 +6642,7 @@ mod owner_control_command_tests {
 
     #[tokio::test]
     async fn observer_channel_controls_reject_sibling_sessions_without_signalling() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let ch = Uuid::new_v4();
         let a = thread_scope(ch, &"a".repeat(64));
@@ -6541,6 +6688,7 @@ mod owner_control_command_tests {
 
     #[tokio::test]
     async fn observer_channel_controls_allow_one_scope_and_ignore_other_channels() {
+        crate::settings::init_for_tests();
         for signal in [
             ControlSignal::Cancel,
             ControlSignal::SwitchModel {
@@ -6575,6 +6723,7 @@ mod owner_control_command_tests {
     // interrupt each other.
     #[tokio::test]
     async fn signal_in_flight_task_for_scope_targets_only_matching_thread() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let ch = Uuid::new_v4();
         let ta = thread_scope(ch, &"a".repeat(64));
@@ -6612,6 +6761,7 @@ mod owner_control_command_tests {
     // that owns its session is busy on another turn.
     #[tokio::test]
     async fn busy_session_owner_holds_batch_instead_of_forking_session() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let ch = Uuid::new_v4();
         let ta = thread_scope(ch, &"a".repeat(64));
@@ -6636,7 +6786,7 @@ mod owner_control_command_tests {
         let now = tokio::time::Instant::now();
         assert!(
             matches!(
-                pool.hold_decision(&ta, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+                pool.hold_decision(&ta, now, settings::get().pool.hold_busy_owner_timeout_secs),
                 pool::HoldDecision::Hold { .. }
             ),
             "busy owner within window => hold"
@@ -6646,8 +6796,8 @@ mod owner_control_command_tests {
             matches!(
                 pool.hold_decision(
                     &ta,
-                    now + pool::HOLD_BUSY_OWNER_TIMEOUT,
-                    pool::HOLD_BUSY_OWNER_TIMEOUT
+                    now + settings::get().pool.hold_busy_owner_timeout_secs,
+                    settings::get().pool.hold_busy_owner_timeout_secs
                 ),
                 pool::HoldDecision::ForkAfterHold { .. }
             ),
@@ -6664,14 +6814,14 @@ mod owner_control_command_tests {
         let cs = scope::SessionScope::Conversation { channel_id: ch };
         pool.record_scope_owner(cs.clone(), 0);
         assert_eq!(
-            pool.hold_decision(&cs, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(&cs, now, settings::get().pool.hold_busy_owner_timeout_secs),
             pool::HoldDecision::Dispatch,
             "conversation scope forks a busy owner rather than holding"
         );
 
         // Re-stamp A's hold so channel invalidation has an entry to prune.
         assert!(matches!(
-            pool.hold_decision(&ta, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(&ta, now, settings::get().pool.hold_busy_owner_timeout_secs),
             pool::HoldDecision::Hold { .. }
         ));
         assert!(pool.held_since_contains(&ta));
@@ -6691,6 +6841,7 @@ mod owner_control_command_tests {
 
     #[tokio::test]
     async fn queue_cap_eviction_prunes_orphaned_hold_deadline() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let mut queue = EventQueue::new(DedupMode::Queue);
         let channel_id = Uuid::new_v4();
@@ -6704,7 +6855,7 @@ mod owner_control_command_tests {
             pool.hold_decision(
                 &held_scope,
                 tokio::time::Instant::now(),
-                pool::HOLD_BUSY_OWNER_TIMEOUT
+                settings::get().pool.hold_busy_owner_timeout_secs
             ),
             pool::HoldDecision::Hold { .. }
         ));
@@ -6717,6 +6868,7 @@ mod owner_control_command_tests {
             event: make_event(KIND_STREAM_MESSAGE, "held", None),
             received_at: oldest,
             prompt_tag: "test".into(),
+            issue: None,
         });
         for i in 0..500 {
             queue.push(queue::QueuedEvent {
@@ -6726,6 +6878,7 @@ mod owner_control_command_tests {
                 event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
                 received_at: std::time::Instant::now(),
                 prompt_tag: "test".into(),
+                issue: None,
             });
         }
 
@@ -6742,6 +6895,7 @@ mod owner_control_command_tests {
 
     #[test]
     fn project_owner_control_signs_only_addressable_project_events() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let events = build_project_owner_announcement_events(
             vec![
@@ -6769,6 +6923,7 @@ mod owner_control_command_tests {
 
     #[test]
     fn project_owner_control_rejects_arbitrary_or_unaddressed_events() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let arbitrary = build_project_owner_announcement_events(
             vec![ProjectOwnerAnnouncementTemplate {
@@ -6800,18 +6955,21 @@ mod owner_cache_tests {
 
     #[test]
     fn new_with_some_caches_immediately() {
+        crate::settings::init_for_tests();
         let cache = OwnerCache::new(Some("abcd".into()));
         assert_eq!(cache.get(), Some("abcd"));
     }
 
     #[test]
     fn new_with_none_returns_none() {
+        crate::settings::init_for_tests();
         let cache = OwnerCache::new(None);
         assert!(cache.get().is_none());
     }
 
     #[test]
     fn get_returns_cached_value() {
+        crate::settings::init_for_tests();
         let cache = OwnerCache::new(Some("ab".repeat(32)));
         assert_eq!(cache.get(), Some("ab".repeat(32)).as_deref());
     }
@@ -6850,6 +7008,7 @@ mod workflow_owner_tests {
 
     #[tokio::test]
     async fn relay_identity_refresh_keeps_last_good_key_after_fetch_error() {
+        crate::settings::init_for_tests();
         let previous = Keys::generate().public_key().to_hex();
         let client = relay::RestClient {
             http: reqwest::Client::new(),
@@ -6866,6 +7025,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn trusted_relay_workflow_uses_owner_for_explicit_target() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent = Keys::generate().public_key().to_hex();
@@ -6885,6 +7045,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn multiple_explicit_targets_each_use_owner() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent_a = Keys::generate().public_key().to_hex();
@@ -6910,6 +7071,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn owner_as_explicit_target_uses_owner_without_duplicate_p_tag() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let event = workflow_event(
@@ -6928,6 +7090,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn legacy_owner_p_tag_without_explicit_target_keeps_relay_signer() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent = owner.clone();
@@ -6947,6 +7110,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn p_tag_without_matching_explicit_target_keeps_relay_signer() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent = Keys::generate().public_key().to_hex();
@@ -6967,6 +7131,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn forged_or_tampered_workflow_keeps_raw_signer() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let attacker = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
@@ -7000,6 +7165,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn malformed_or_ambiguous_metadata_fails_closed() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent = Keys::generate().public_key().to_hex();
@@ -7088,6 +7254,7 @@ mod workflow_owner_tests {
 
     #[test]
     fn wrong_kind_or_missing_relay_identity_fails_closed() {
+        crate::settings::init_for_tests();
         let relay = Keys::generate();
         let owner = Keys::generate().public_key().to_hex();
         let agent = Keys::generate().public_key().to_hex();
@@ -7360,6 +7527,7 @@ mod author_gate_tests {
     /// fail; using the raw relay signer makes the OwnerOnly case fail.
     #[tokio::test]
     async fn production_listener_boundaries_apply_workflow_owner_policy() {
+        crate::settings::init_for_tests();
         for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
@@ -7423,6 +7591,7 @@ mod author_gate_tests {
     /// principals remain allowed; `Nobody` remains absolute.
     #[tokio::test]
     async fn production_listener_boundaries_enforce_dm_author_policy() {
+        crate::settings::init_for_tests();
         for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
@@ -7542,6 +7711,7 @@ mod author_gate_tests {
     /// the relay signer denied and makes this recovery assertion fail.
     #[tokio::test]
     async fn production_listener_boundaries_recover_relay_identity() {
+        crate::settings::init_for_tests();
         for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
             let relay_keys = nostr::Keys::generate();
             let relay_hex = relay_keys.public_key().to_hex();
@@ -7589,6 +7759,7 @@ mod author_gate_tests {
     /// private to the gate module.
     #[tokio::test]
     async fn test_connected_gate_wakes_owner_only_agent_for_relay_signed_workflow() {
+        crate::settings::init_for_tests();
         let relay_keys = nostr::Keys::generate();
         let relay_hex = relay_keys.public_key().to_hex();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
@@ -7650,6 +7821,7 @@ mod author_gate_tests {
     /// exact state the wiring regression above proves the listeners avoid.
     #[tokio::test]
     async fn test_gate_without_relay_identity_fails_closed_to_raw_signer() {
+        crate::settings::init_for_tests();
         let relay_keys = nostr::Keys::generate();
         let relay_hex = relay_keys.public_key().to_hex();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
@@ -7695,6 +7867,7 @@ mod author_gate_tests {
     /// separate identity-refresh call.
     #[tokio::test]
     async fn test_gate_refresh_arms_attribution_after_reconnect() {
+        crate::settings::init_for_tests();
         let relay_keys = nostr::Keys::generate();
         let relay_hex = relay_keys.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
@@ -7753,6 +7926,7 @@ mod author_gate_tests {
 
     #[test]
     fn refresh_needed_until_generation_completes() {
+        crate::settings::init_for_tests();
         use super::inbound_author_gate::refresh_needed;
         assert!(refresh_needed(None, 0));
         assert!(refresh_needed(None, 1));
@@ -7765,6 +7939,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_generation_zero_retries_failed_startup_identity() {
+        crate::settings::init_for_tests();
         let relay_keys = nostr::Keys::generate();
         let relay_hex = relay_keys.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
@@ -7817,6 +7992,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_authoritative_startup_result_completes_generation_zero() {
+        crate::settings::init_for_tests();
         let relay_keys = nostr::Keys::generate();
         let next_relay_keys = nostr::Keys::generate();
         let relay_hex = relay_keys.public_key().to_hex();
@@ -7900,6 +8076,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_generation_refresh_retries_after_nip11_failure() {
+        crate::settings::init_for_tests();
         let old_relay = nostr::Keys::generate();
         let new_relay = nostr::Keys::generate();
         let old_relay_hex = old_relay.public_key().to_hex();
@@ -7992,6 +8169,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_combined_gate_accepts_explicit_trusted_workflow_target_only() {
+        crate::settings::init_for_tests();
         let relay = nostr::Keys::generate();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
@@ -8032,6 +8210,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_combined_gate_rejects_owner_p_tag_without_explicit_workflow_target() {
+        crate::settings::init_for_tests();
         let relay = nostr::Keys::generate();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
         let agent = workflow_owner.clone();
@@ -8071,6 +8250,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_combined_gate_rejects_forged_workflow_attribution() {
+        crate::settings::init_for_tests();
         let relay = nostr::Keys::generate();
         let attacker = nostr::Keys::generate();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
@@ -8113,6 +8293,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_accepts_sibling_not_in_allowlist() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
@@ -8131,6 +8312,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_accepts_explicit_external_pubkey() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
@@ -8149,6 +8331,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_rejects_non_sibling_not_in_allowlist() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
@@ -8167,6 +8350,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_accepts_owner() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         let allowlist = HashSet::new();
         assert!(
@@ -8189,6 +8373,7 @@ mod author_gate_tests {
     // pin that invariant against the default mode.
     #[tokio::test]
     async fn test_owner_only_rejects_stranger_so_no_steer() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         assert!(
             !inbound_author_gate::test_author_allowed(
@@ -8206,6 +8391,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_owner_only_admits_owner_and_sibling_to_steer() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
             assert!(
@@ -8232,6 +8418,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_rejects_allowlisted_external_pubkey() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
@@ -8250,6 +8437,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_rejects_stranger_under_anyone() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         assert!(
             !inbound_author_gate::test_author_allowed(
@@ -8267,6 +8455,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_admits_owner_and_sibling_in_every_responding_mode() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         for mode in [
             RespondTo::OwnerOnly,
@@ -8292,6 +8481,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_nobody_rejects_even_owner() {
+        crate::settings::init_for_tests();
         let cache = cache_with_sibling();
         assert!(
             !inbound_author_gate::test_author_allowed(
@@ -8315,6 +8505,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_is_dm_channel_uses_definitive_startup_metadata() {
+        crate::settings::init_for_tests();
         let dm_id = Uuid::new_v4();
         let stream_id = Uuid::new_v4();
         let startup = HashMap::from([
@@ -8342,6 +8533,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_is_dm_channel_fails_closed_for_unknown_startup_metadata() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let startup = HashMap::from([(
             id,
@@ -8405,6 +8597,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_is_dm_channel_lazy_resolves_declared_dm_and_caches_it() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
 
         let id = Uuid::new_v4();
@@ -8425,6 +8618,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_discovery_without_metadata_stays_fail_closed_at_author_gate() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
         let channel_info = resolver(discovered);
@@ -8449,6 +8643,7 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_is_dm_channel_fails_closed_when_lazy_resolution_fails() {
+        crate::settings::init_for_tests();
         assert!(
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
@@ -8475,6 +8670,7 @@ mod observer_snapshot_race_tests {
     /// deliver it exactly once — and never lose events on either side of it.
     #[tokio::test(start_paused = true)]
     async fn overlap_between_subscribe_and_snapshot_publishes_exactly_once() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
@@ -8603,6 +8799,7 @@ mod observer_publish_queue_tests {
     /// while both stores are non-empty — neither may drift.
     #[test]
     fn walked_retained_bytes_agrees_with_the_accumulator_exactly() {
+        crate::settings::init_for_tests();
         fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
             let mut e = event(seq, "acp_read", Some("chan-a"));
             e.payload = serde_json::json!({
@@ -8654,6 +8851,7 @@ mod observer_publish_queue_tests {
     /// envelope whose payload carries every inner event in arrival order.
     #[test]
     fn multiple_events_ship_as_one_envelope_in_order() {
+        crate::settings::init_for_tests();
         let mut queue = queue_of(vec![
             event(1, "turn_started", Some("chan-a")),
             event(2, "acp_read", Some("chan-a")),
@@ -8673,6 +8871,7 @@ mod observer_publish_queue_tests {
     /// consumers that predate batching still understand quiet periods.
     #[test]
     fn a_single_event_stays_unwrapped() {
+        crate::settings::init_for_tests();
         let mut queue = queue_of(vec![event(7, "turn_started", Some("chan-a"))]);
         let frame = queue.next_frame().expect("one frame");
         assert!(queue.is_empty());
@@ -8684,6 +8883,7 @@ mod observer_publish_queue_tests {
     /// publish anything.
     #[test]
     fn empty_queue_yields_no_frame() {
+        crate::settings::init_for_tests();
         let mut queue = ObserverPublishQueue::default();
         assert!(queue.next_frame().is_none());
         assert!(queue.is_empty());
@@ -8697,6 +8897,7 @@ mod observer_publish_queue_tests {
     /// nothing gathers across.
     #[test]
     fn frames_never_mix_channels_and_gather_queue_wide() {
+        crate::settings::init_for_tests();
         let mut queue = queue_of(vec![
             event(1, "acp_read", Some("chan-a")),
             event(2, "acp_write", Some("chan-a")),
@@ -8738,6 +8939,7 @@ mod observer_publish_queue_tests {
     /// The null event itself ships only its contiguous front run.
     #[test]
     fn null_channel_events_are_gather_barriers() {
+        crate::settings::init_for_tests();
         let mut queue = queue_of(vec![
             event(1, "acp_read", Some("chan-a")),
             event(2, "acp_read", Some("chan-b")),
@@ -8761,6 +8963,7 @@ mod observer_publish_queue_tests {
     /// slots per channel, not one slot per event.
     #[test]
     fn interleaved_channels_drain_at_bytes_per_slot_not_events_per_slot() {
+        crate::settings::init_for_tests();
         let mut events = Vec::new();
         for i in 0..100u64 {
             events.push(event(2 * i + 1, "acp_read", Some("chan-a")));
@@ -8798,6 +9001,7 @@ mod observer_publish_queue_tests {
     /// every frame under the cap and no event lost or reordered.
     #[test]
     fn oversized_backlogs_split_across_publish_slots_under_the_cap() {
+        crate::settings::init_for_tests();
         let big_text = "x".repeat(30_000);
         let mut queue = queue_of(
             (1..=6)
@@ -8834,6 +9038,7 @@ mod observer_publish_queue_tests {
     /// never leapfrog a tool call that arrived after them.
     #[test]
     fn non_chunk_events_flush_pending_chunks_ahead_of_themselves() {
+        crate::settings::init_for_tests();
         fn chunk(seq: u64, text: &str) -> observer::ObserverEvent {
             let mut e = event(seq, "acp_read", Some("chan-a"));
             e.payload = serde_json::json!({
@@ -8867,6 +9072,7 @@ mod observer_publish_queue_tests {
     /// are picked up by the publish slot itself, not stranded.
     #[test]
     fn a_publish_slot_flushes_pending_coalesced_chunks() {
+        crate::settings::init_for_tests();
         let mut e = event(1, "acp_read", Some("chan-a"));
         e.payload = serde_json::json!({
             "params": { "update": {
@@ -8893,6 +9099,7 @@ mod observer_publish_queue_tests {
     /// publishes in order with nothing else lost.
     #[test]
     fn over_budget_floods_drop_oldest_with_accounting() {
+        crate::settings::init_for_tests();
         let big_text = "y".repeat(10_000);
         let total = 500usize; // ~5MB of ~10KB events > 4MiB budget
         let mut queue = ObserverPublishQueue::default();
@@ -8907,7 +9114,8 @@ mod observer_publish_queue_tests {
             "a 5MB backlog must overflow the 4MiB budget"
         );
         assert!(
-            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            walked_retained_bytes(&queue)
+                <= crate::settings::get().lib.observer_pending_queue_max_bytes,
             "eviction must restore the byte budget (entry-walked), got {}",
             walked_retained_bytes(&queue)
         );
@@ -8937,6 +9145,7 @@ mod observer_publish_queue_tests {
     /// under cap while true retention was 1.99x over.
     #[test]
     fn distinct_key_chunk_floods_are_bounded_by_the_byte_budget() {
+        crate::settings::init_for_tests();
         let big_text = "z".repeat(50_000);
         let total = 500u64; // ~25MB pending chunk text vs a 4MiB budget
         let mut queue = ObserverPublishQueue::default();
@@ -8959,7 +9168,7 @@ mod observer_publish_queue_tests {
 
         let walked = walked_retained_bytes(&queue);
         assert!(
-            walked <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            walked <= crate::settings::get().lib.observer_pending_queue_max_bytes,
             "TRUE retained bytes (walked from entries) must respect the cap, \
              got {walked}"
         );
@@ -8995,6 +9204,7 @@ mod observer_publish_queue_tests {
     /// events vanished from the accounting.
     #[test]
     fn evicting_a_merged_chunk_entry_accounts_every_source_event() {
+        crate::settings::init_for_tests();
         fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
             let mut e = event(seq, "acp_read", Some("chan-a"));
             e.payload = serde_json::json!({
@@ -9033,7 +9243,8 @@ mod observer_publish_queue_tests {
         }
 
         assert!(
-            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            walked_retained_bytes(&queue)
+                <= crate::settings::get().lib.observer_pending_queue_max_bytes,
             "eviction must restore the byte budget (entry-walked), got {}",
             walked_retained_bytes(&queue)
         );
@@ -9064,6 +9275,7 @@ mod observer_publish_queue_tests {
     /// FIFO eviction to `dropped += 1` survived all 687 tests until this one.
     #[test]
     fn evicting_a_flushed_merged_entry_from_the_fifo_accounts_every_source_event() {
+        crate::settings::init_for_tests();
         fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
             let mut e = event(seq, "acp_read", Some("chan-a"));
             e.payload = serde_json::json!({
@@ -9113,7 +9325,8 @@ mod observer_publish_queue_tests {
         }
 
         assert!(
-            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            walked_retained_bytes(&queue)
+                <= crate::settings::get().lib.observer_pending_queue_max_bytes,
             "eviction must restore the byte budget (entry-walked), got {}",
             walked_retained_bytes(&queue)
         );
@@ -9140,6 +9353,7 @@ mod observer_publish_queue_tests {
     /// publishes exactly once.
     #[test]
     fn under_budget_backlogs_are_lossless() {
+        crate::settings::init_for_tests();
         let mut queue = queue_of(
             (1..=200)
                 .map(|seq| event(seq, "acp_read", Some("chan-a")))
@@ -9200,6 +9414,7 @@ mod observer_publish_cadence_tests {
     /// on reconnect), frame 1 arrives at +1s, frame 2 no earlier than +2s.
     #[tokio::test(start_paused = true)]
     async fn one_frame_per_second_and_no_startup_burst() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
@@ -9279,6 +9494,7 @@ mod observer_publish_cadence_tests {
     /// exits only after the queue is empty — paced, lossless, in order.
     #[tokio::test(start_paused = true)]
     async fn shutdown_drain_is_paced_and_lossless() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
@@ -9348,6 +9564,7 @@ mod observer_publish_cadence_tests {
     /// bypasses exactly what the pacer exists to prevent.
     #[tokio::test(start_paused = true)]
     async fn missed_ticks_skip_instead_of_bursting() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
@@ -9452,6 +9669,7 @@ mod observer_chunk_coalescer_tests {
 
     #[test]
     fn coalesces_chunks_until_non_chunk_event() {
+        crate::settings::init_for_tests();
         let mut coalescer = ObserverChunkCoalescer::default();
 
         assert!(coalescer
@@ -9475,6 +9693,7 @@ mod observer_chunk_coalescer_tests {
 
     #[test]
     fn keeps_independent_chunk_streams_separate() {
+        crate::settings::init_for_tests();
         let mut coalescer = ObserverChunkCoalescer::default();
 
         assert!(coalescer
@@ -9505,14 +9724,21 @@ mod build_mcp_servers_tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     pub(super) fn test_config() -> Config {
+        crate::settings::init_for_tests();
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
-            idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+            idle_timeout_secs: crate::settings::get()
+                .config
+                .default_idle_timeout_secs
+                .as_secs(),
+            max_turn_duration_secs: crate::settings::get()
+                .config
+                .max_turn_duration_secs
+                .as_secs(),
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
@@ -9604,6 +9830,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn invalid_git_identity_mode_fails_install() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         let err = install_git_with_env(
             &test_config(),
@@ -9617,6 +9844,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn user_mode_mcp_block_drops_inherited_identity_and_signing() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         let inherited = [
             ("user.name", "Inherited Agent"),
@@ -9694,6 +9922,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn for_config_replaces_persona_git_identity_with_resolved_mode() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         let mut config = test_config();
         config
@@ -9727,6 +9956,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn session_new_forwards_complete_git_block_without_duplicate_names() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         let mut config = test_config();
         let git = install_git_with_env(&config, &[]).unwrap();
@@ -9761,6 +9991,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn session_new_mcp_server_has_required_fields() {
+        crate::settings::init_for_tests();
         let config = test_config();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
@@ -9780,6 +10011,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn session_new_mcp_server_forwards_buzz_auth_tag() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
@@ -9797,6 +10029,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn session_new_mcp_server_skips_empty_buzz_auth_tag() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
@@ -9810,6 +10043,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_set_is_forwarded_to_mcp_server() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
         let config = test_config();
@@ -9829,6 +10063,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_unset_omits_the_key_entirely() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
         let config = test_config();
@@ -9847,6 +10082,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn test_display_name_empty_omits_the_key_entirely() {
+        crate::settings::init_for_tests();
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "");
         let config = test_config();
@@ -9864,6 +10100,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn empty_mcp_command_returns_no_servers() {
+        crate::settings::init_for_tests();
         let mut config = test_config();
         config.mcp_command = "".into();
         let servers = build_mcp_servers(&config);
@@ -9875,6 +10112,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
+        crate::settings::init_for_tests();
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
         let servers = build_mcp_servers(&config);
@@ -9884,6 +10122,7 @@ mod build_mcp_servers_tests {
 
     #[test]
     fn mcp_command_with_no_stem_falls_back_to_mcp() {
+        crate::settings::init_for_tests();
         // Path::new("").file_stem() returns None — exercises the unwrap_or("mcp") path.
         let mut config = test_config();
         config.mcp_command = "".into();
@@ -9956,6 +10195,7 @@ mod edit_mention_admission_tests {
     /// matches the startup rule; an edit without the agent's `p` tag does not.
     #[tokio::test]
     async fn default_startup_rules_admit_only_edits_that_mention_the_agent() {
+        crate::settings::init_for_tests();
         let mut config = build_mcp_servers_tests::test_config();
         config.subscribe_mode = SubscribeMode::Mentions;
         let agent = config.keys.public_key().to_hex();
@@ -9989,12 +10229,14 @@ mod edit_native_steer_tests {
     /// bare `e` tag, so the live turn replies in the original's thread.
     #[test]
     fn native_steer_body_carries_edit_original_routing() {
+        crate::settings::init_for_tests();
         let root = "ab".repeat(32);
         let original = message(Some(&root));
         let edit = edit_event(&original.id.to_hex(), &[]);
         let be = queue::BatchEvent {
             event: edit.clone(),
             prompt_tag: "@mention".into(),
+            issue: None,
             received_at: std::time::Instant::now(),
             edit: Some(queue::ResolvedEdit {
                 target_event_id: original.id.to_hex(),
@@ -10012,6 +10254,7 @@ mod edit_native_steer_tests {
     /// The listener hands the steer path the same resolved route it queues.
     #[test]
     fn listener_steer_event_keeps_resolved_edit() {
+        crate::settings::init_for_tests();
         let original = message(None);
         let edit = edit_event(&original.id.to_hex(), &[]);
         let channel_id = Uuid::new_v4();
@@ -10132,6 +10375,7 @@ mod edit_native_steer_tests {
     /// is not cancelled.
     #[tokio::test]
     async fn routed_edit_in_running_thread_steers_natively() {
+        crate::settings::init_for_tests();
         let root = "ab".repeat(32);
         let original = message(Some(&root));
         let (steer, control) = steer_edit_into_running_turn(message(Some(&root)), &original);
@@ -10153,6 +10397,7 @@ mod edit_native_steer_tests {
     /// replies to the edit belong to the same new thread.
     #[tokio::test]
     async fn edit_of_running_top_level_trigger_steers_natively() {
+        crate::settings::init_for_tests();
         let original = message(None);
         let (steer, control) = steer_edit_into_running_turn(original.clone(), &original);
 
@@ -10169,6 +10414,7 @@ mod edit_native_steer_tests {
     /// cancel+merge path instead; its re-prompt routes replies to B.
     #[tokio::test]
     async fn routed_edit_for_another_thread_cancels_and_merges() {
+        crate::settings::init_for_tests();
         let thread_b = "ab".repeat(32);
         let original = message(Some(&thread_b));
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
@@ -10181,6 +10427,7 @@ mod edit_native_steer_tests {
     /// rooted at the original, not at the running turn's top-level trigger.
     #[tokio::test]
     async fn routed_edit_for_another_top_level_message_cancels_and_merges() {
+        crate::settings::init_for_tests();
         let original = message(None);
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
 
@@ -10527,8 +10774,14 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
-            idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+            idle_timeout_secs: crate::settings::get()
+                .config
+                .default_idle_timeout_secs
+                .as_secs(),
+            max_turn_duration_secs: crate::settings::get()
+                .config
+                .max_turn_duration_secs
+                .as_secs(),
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
@@ -10572,6 +10825,7 @@ mod error_outcome_emission_tests {
 
     #[test]
     fn normalizes_agent_name_from_initialize_result() {
+        crate::settings::init_for_tests();
         assert_eq!(
             normalized_agent_name(&serde_json::json!({
                 "agentInfo": { "name": " Goose ", "version": "1.43.0" }
@@ -10621,6 +10875,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let steer_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut agent = dummy_agent(0).await;
@@ -10702,6 +10957,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn in_flight_stale_native_steer_ack_cannot_update_replacement_session() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let mut agent = dummy_agent(0).await;
         agent.state.sessions.insert(
@@ -10782,6 +11038,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn successful_native_steer_ack_after_task_return_updates_matching_live_session() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let steer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let mut agent = dummy_agent(0).await;
@@ -10810,6 +11067,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn late_native_steer_ack_cannot_update_replacement_session() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let mut agent = dummy_agent(0).await;
         agent.state.sessions.insert(
@@ -10837,6 +11095,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn invalidated_session_does_not_resurrect_successful_steer_delivery_state() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let agent = dummy_agent(0).await;
         // No live session: simulates the prompt task invalidating before return.
@@ -10978,11 +11237,13 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn agent_exited_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         assert_eq!(turn_errors_emitted_for(PromptOutcome::AgentExited).await, 1);
     }
 
     #[tokio::test]
     async fn panic_event_retains_task_turn_id() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -11053,6 +11314,7 @@ mod error_outcome_emission_tests {
     // the requeued batch stays wedged until the ~2h in-flight backstop.
     #[tokio::test]
     async fn panic_recovery_frees_the_exact_thread_scope() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
         let scope = scope::SessionScope::Thread {
@@ -11073,6 +11335,7 @@ mod error_outcome_emission_tests {
             event,
             received_at: std::time::Instant::now(),
             prompt_tag: "t".into(),
+            issue: None,
         });
         let batch = queue.flush_next().expect("flush thread batch");
         assert!(queue.is_scope_in_flight(&scope));
@@ -11148,6 +11411,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn idle_timeout_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         assert_eq!(
             turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Idle)).await,
             1
@@ -11156,6 +11420,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn hard_timeout_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         assert_eq!(
             turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: false
@@ -11167,6 +11432,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn cancel_drain_timeout_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         assert_eq!(
             turn_errors_emitted_for(PromptOutcome::CancelDrainTimeout(
                 std::time::Duration::from_secs(5)
@@ -11179,6 +11445,7 @@ mod error_outcome_emission_tests {
     /// idle_timeout outcome_label is "idle_timeout"; hard_timeout is "hard_timeout".
     #[tokio::test]
     async fn timeout_outcome_labels_differ() {
+        crate::settings::init_for_tests();
         let check_label = |outcome: PromptOutcome, expected_label: &'static str| async move {
             let agent = dummy_agent(0).await;
             let mut pool = AgentPool::from_slots(vec![None]);
@@ -11255,6 +11522,7 @@ mod error_outcome_emission_tests {
     /// hard-cap timeout dead-letters immediately (no requeue); idle timeout is requeued.
     #[tokio::test]
     async fn hard_timeout_not_requeued_idle_timeout_is_requeued() {
+        crate::settings::init_for_tests();
         let make_batch = || {
             let keys = Keys::generate();
             let event = EventBuilder::new(Kind::Custom(9), "test")
@@ -11268,6 +11536,7 @@ mod error_outcome_emission_tests {
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
+                    issue: None,
                     received_at: std::time::Instant::now(),
                 }],
                 cancelled_events: vec![],
@@ -11365,6 +11634,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn hard_timeout_recently_active_requeues_batch() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let make_batch = || {
             let keys = Keys::generate();
@@ -11378,6 +11648,7 @@ mod error_outcome_emission_tests {
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
+                    issue: None,
                     received_at: std::time::Instant::now(),
                 }],
                 cancelled_events: vec![],
@@ -11464,6 +11735,7 @@ mod error_outcome_emission_tests {
     /// observer payload must say so.
     #[tokio::test]
     async fn hard_timeout_recently_active_requeue_success_reports_requeued_for_retry() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -11502,6 +11774,7 @@ mod error_outcome_emission_tests {
                     .sign_with_keys(&Keys::generate())
                     .unwrap(),
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -11550,18 +11823,19 @@ mod error_outcome_emission_tests {
     }
 
     /// Same recently-active hard timeout, but the channel has already
-    /// exhausted its retry budget ([`crate::queue::MAX_RETRIES`] prior
+    /// exhausted its retry budget (`queue.max_retries` prior
     /// attempts) — `queue.requeue()` dead-letters instead of requeueing, and
     /// the observer payload must report that fate, not the requeue wording
     /// above.
     #[tokio::test]
     async fn hard_timeout_recently_active_budget_exhausted_reports_dead_lettered() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        // Simulate MAX_RETRIES prior failed attempts on this channel so the
+        // Simulate max_retries prior failed attempts on this channel so the
         // upcoming requeue() call in handle_prompt_result crosses the
         // dead-letter threshold.
-        queue.set_retry_count_for_test(channel_id, crate::queue::MAX_RETRIES);
+        queue.set_retry_count_for_test(channel_id, crate::settings::get().queue.max_retries);
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -11599,6 +11873,7 @@ mod error_outcome_emission_tests {
                     .sign_with_keys(&Keys::generate())
                     .unwrap(),
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -11660,6 +11935,7 @@ mod error_outcome_emission_tests {
     /// exactly once each — proving no loss and no duplication.
     #[tokio::test]
     async fn cancel_drain_timeout_requeues_batch_and_does_not_return_agent() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let original_event = EventBuilder::new(Kind::Custom(9), "original")
             .sign_with_keys(&keys)
@@ -11679,6 +11955,7 @@ mod error_outcome_emission_tests {
                 edit: None,
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -11713,6 +11990,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            issue: None,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -11828,6 +12106,7 @@ mod error_outcome_emission_tests {
     /// still respawned exactly as in the preserved case.
     #[tokio::test]
     async fn cancel_drain_timeout_dropped_stop_batch_none_same_neutral_payload() {
+        crate::settings::init_for_tests();
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -11928,18 +12207,21 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn transport_error_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         let io = AcpError::Io(std::io::Error::other("pipe broke"));
         assert_eq!(turn_errors_emitted_for(PromptOutcome::Error(io)).await, 1);
     }
 
     #[tokio::test]
     async fn application_error_emits_exactly_one_feed_event() {
+        crate::settings::init_for_tests();
         let app = AcpError::IdleTimeout(std::time::Duration::from_secs(1));
         assert_eq!(turn_errors_emitted_for(PromptOutcome::Error(app)).await, 1);
     }
 
     #[tokio::test]
     async fn indeterminate_project_context_requeues_without_poisoning_agent_or_circuit() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let session_scope = scope::SessionScope::Conversation { channel_id };
         let event = EventBuilder::new(Kind::Custom(9), "project work")
@@ -11952,6 +12234,7 @@ mod error_outcome_emission_tests {
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -12039,6 +12322,7 @@ mod error_outcome_emission_tests {
 
     #[test]
     fn is_auth_error_matches_reauthenticate_message() {
+        crate::settings::init_for_tests();
         let e = acp::AcpError::AgentError {
             code: -32000,
             message: "API Error: OAuth access token has expired. Re-authenticate to continue."
@@ -12052,6 +12336,7 @@ mod error_outcome_emission_tests {
 
     #[test]
     fn is_auth_error_matches_401_message() {
+        crate::settings::init_for_tests();
         let e = acp::AcpError::AgentError {
             code: -32000,
             message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
@@ -12064,6 +12349,7 @@ mod error_outcome_emission_tests {
 
     #[test]
     fn is_auth_error_rejects_other_agent_error_message() {
+        crate::settings::init_for_tests();
         let e = acp::AcpError::AgentError {
             code: -32601,
             message: "Usage credits required for 1M context — turn on usage credits".to_string(),
@@ -12076,6 +12362,7 @@ mod error_outcome_emission_tests {
 
     #[test]
     fn is_auth_error_rejects_transport_errors() {
+        crate::settings::init_for_tests();
         let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
         assert!(
             !is_auth_error(&io),
@@ -12095,6 +12382,7 @@ mod error_outcome_emission_tests {
     /// rather than after 10 futile retries.
     #[tokio::test]
     async fn auth_error_dead_letters_immediately_without_requeueing() {
+        crate::settings::init_for_tests();
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -12107,6 +12395,7 @@ mod error_outcome_emission_tests {
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -12213,6 +12502,7 @@ mod error_outcome_emission_tests {
                 edit,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -12351,6 +12641,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn model_not_found_posts_recovery_notice_without_retrying() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let root = nostr::EventId::from_byte_array([0xaa; 32]);
         let parent = nostr::EventId::from_byte_array([0xbb; 32]);
@@ -12384,6 +12675,7 @@ mod error_outcome_emission_tests {
     /// at channel top level (the edit's bare `e` tag is not a thread link).
     #[tokio::test]
     async fn failure_notice_for_threaded_edit_posts_in_original_thread() {
+        crate::settings::init_for_tests();
         let root = "aa".repeat(32);
         let original = crate::edit_routing::test_support::message(Some(&root));
         let edit = crate::edit_routing::test_support::edit_event(&original.id.to_hex(), &[]);
@@ -12402,6 +12694,7 @@ mod error_outcome_emission_tests {
     /// A top-level edited message gets its notice as a reply to the original.
     #[tokio::test]
     async fn failure_notice_for_top_level_edit_replies_to_original() {
+        crate::settings::init_for_tests();
         let original = crate::edit_routing::test_support::message(None);
         let original_id = original.id.to_hex();
         let edit = crate::edit_routing::test_support::edit_event(&original_id, &[]);
@@ -12420,6 +12713,7 @@ mod error_outcome_emission_tests {
     /// the notice. A threaded original then gets the notice in its thread.
     #[tokio::test]
     async fn failure_notice_retries_unresolved_edit_lookup() {
+        crate::settings::init_for_tests();
         let root = "aa".repeat(32);
         let original = crate::edit_routing::test_support::message(Some(&root));
         let edit = crate::edit_routing::test_support::edit_event(&original.id.to_hex(), &[]);
@@ -12441,6 +12735,7 @@ mod error_outcome_emission_tests {
     /// The notice posts at channel top level instead.
     #[tokio::test]
     async fn failure_notice_for_unresolved_edit_claims_no_root() {
+        crate::settings::init_for_tests();
         let target = "cc".repeat(32);
         let edit = crate::edit_routing::test_support::edit_event(&target, &[]);
         let (notice, _, _) = capture_model_not_found_notice(edit.clone(), None).await;
@@ -12463,6 +12758,7 @@ mod error_outcome_emission_tests {
     /// standard requeue path so today's behavior is unchanged.
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
+        crate::settings::init_for_tests();
         assert_application_error_is_requeued(acp::AcpError::AgentError {
             code: -32000,
             message: "Usage credits required for 1M context".to_string(),
@@ -12472,6 +12768,7 @@ mod error_outcome_emission_tests {
 
     #[tokio::test]
     async fn non_model_resource_not_found_is_requeued() {
+        crate::settings::init_for_tests();
         assert_application_error_is_requeued(acp::AcpError::AgentError {
             code: -32002,
             message: "Resource not found: session no longer exists".to_string(),
@@ -12492,6 +12789,7 @@ mod error_outcome_emission_tests {
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -12584,6 +12882,7 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_under_budget_frame_passes_through_byte_identical() {
+        crate::settings::init_for_tests();
         let mut event = event_with_payload("acp_read", serde_json::json!({ "body": "small" }));
         let before = serialized(&event);
         fit_observer_event_to_budget(&mut event);
@@ -12596,6 +12895,7 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_single_giant_leaf_is_elided_to_fit_with_envelope_intact() {
+        crate::settings::init_for_tests();
         let big = "x".repeat(100_000);
         let mut event = event_with_payload("acp_read", serde_json::json!({ "body": big }));
         fit_observer_event_to_budget(&mut event);
@@ -12615,11 +12915,11 @@ mod observer_payload_trim_tests {
 
         let leaf = event.payload["body"].as_str().unwrap();
         assert!(
-            leaf.starts_with(&"x".repeat(OBSERVER_LEAF_RETAIN_BYTES)),
+            leaf.starts_with(&"x".repeat(crate::settings::get().lib.observer_leaf_retain_bytes)),
             "head retained"
         );
         assert!(
-            leaf.ends_with(&"x".repeat(OBSERVER_LEAF_RETAIN_BYTES)),
+            leaf.ends_with(&"x".repeat(crate::settings::get().lib.observer_leaf_retain_bytes)),
             "tail retained"
         );
         // N in the marker is RAW bytes removed: original len minus retained len.
@@ -12632,6 +12932,7 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_multi_block_prompt_retains_every_section_header_after_elision() {
+        crate::settings::init_for_tests();
         // The real session/prompt fix: format_prompt now emits one block per
         // section, so the observer payload is params.prompt = [{text: "[Base]…"},
         // {text: "[Agent Memory — core]…"}, … {text: "[Buzz event: …]…<huge>"}].
@@ -12703,6 +13004,7 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_multi_leaf_elides_largest_shrinkable_first_and_stops_when_it_fits() {
+        crate::settings::init_for_tests();
         // One leaf alone over the cap; a second smaller-but-still-large leaf.
         // Eliding the biggest should suffice, leaving the smaller intact.
         let mut event = event_with_payload(
@@ -12728,6 +13030,7 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_coalesced_chunk_nested_leaf_is_reached_by_recursive_walk() {
+        crate::settings::init_for_tests();
         // The coalesced-chunk big leaf lives at params.update.content.text,
         // not a top-level field — the walk must recurse to reach it.
         let big = "z".repeat(80_000);
@@ -12753,10 +13056,11 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_many_medium_leaves_terminate_via_stub() {
+        crate::settings::init_for_tests();
         // Many leaves each too small to shrink on their own (below 2x retain),
         // collectively over the cap. No leaf can strictly shrink, so the trimmer
         // must terminate via the stub rather than loop forever.
-        let leaf = "m".repeat(OBSERVER_LEAF_RETAIN_BYTES); // shorter than head+tail → cannot shrink
+        let leaf = "m".repeat(crate::settings::get().lib.observer_leaf_retain_bytes); // shorter than head+tail → cannot shrink
         let items: Vec<serde_json::Value> = (0..40)
             .map(|_| serde_json::Value::String(leaf.clone()))
             .collect();
@@ -12779,20 +13083,22 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn test_leaf_too_small_to_shrink_is_not_mutated() {
+        crate::settings::init_for_tests();
         // A frame already under budget whose only leaf is below the shrink floor:
         // nothing should change. (Under-budget short-circuits, and even if forced,
         // leaf_shrinks would reject it.)
-        let short = "s".repeat(OBSERVER_LEAF_RETAIN_BYTES); // == head; cannot strictly shrink
+        let short = "s".repeat(crate::settings::get().lib.observer_leaf_retain_bytes); // == head; cannot strictly shrink
         assert!(
             !leaf_shrinks(&short),
             "a leaf at the retain floor must not shrink"
         );
-        let longer = "L".repeat(OBSERVER_LEAF_RETAIN_BYTES * 2 + 100);
+        let longer = "L".repeat(crate::settings::get().lib.observer_leaf_retain_bytes * 2 + 100);
         assert!(leaf_shrinks(&longer), "a clearly larger leaf must shrink");
     }
 
     #[test]
     fn test_utf8_multibyte_leaf_elides_on_char_boundary() {
+        crate::settings::init_for_tests();
         // A leaf of 3-byte chars (… = U+2026) — eliding must land on char
         // boundaries and never panic or produce invalid UTF-8.
         let big: String = "…".repeat(40_000); // 120_000 bytes

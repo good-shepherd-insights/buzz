@@ -45,9 +45,10 @@ impl SessionPolicy {
     /// Append only the configured session model to the shared base instructions.
     /// The resulting base is reused by modern and legacy ACP standing context.
     pub(crate) fn append_session_model(self, base_prompt: &str) -> String {
+        let text = &crate::settings::get().text;
         let session_model = match self {
-            Self::Channel => include_str!("session_model_channel.md"),
-            Self::Thread => include_str!("session_model_thread.md"),
+            Self::Channel => &text.session_model_channel,
+            Self::Thread => &text.session_model_thread,
         };
         format!("{}\n\n{}", base_prompt.trim_end(), session_model.trim_end())
     }
@@ -193,6 +194,7 @@ mod tests {
 
     #[test]
     fn session_model_is_appended_once_and_matches_policy() {
+        crate::settings::init_for_tests();
         let base = include_str!("base_prompt.md");
         assert!(!base.contains("## Session Model"));
         for policy in [SessionPolicy::Channel, SessionPolicy::Thread] {

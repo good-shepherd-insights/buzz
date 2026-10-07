@@ -100,9 +100,12 @@ fn make_prompt_context(
             // consume this same assembled base (including custom base files).
             let base = base_prompt_content
                 .map(String::as_str)
-                .unwrap_or(include_str!("base_prompt.md"));
+                .unwrap_or(crate::settings::get().text.base_prompt.as_str());
             Some(if matches!(mode, SessionMode::Task) {
-                format!("{base}\n\n{}", include_str!("session_model_task.md"))
+                format!(
+                    "{base}\n\n{}",
+                    crate::settings::get().text.session_model_task
+                )
             } else {
                 config.session_policy.append_session_model(base)
             })
@@ -121,5 +124,7 @@ fn make_prompt_context(
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        goal: None,
+        continuation_tx: None,
     })
 }

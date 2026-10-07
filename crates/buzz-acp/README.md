@@ -7,6 +7,56 @@ For one prepared local task, use **`buzz-acp run --task <path|->`**. See
 
 ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
 
+A task is named by the agent, then created. The full contract is [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md).
+
+```mermaid
+sequenceDiagram
+    participant Channel
+    participant Bridge
+    participant Fastino
+    participant Claude
+    participant Multica
+
+    Channel->>Bridge: mention
+    Bridge->>Fastino: message text
+    Fastino-->>Bridge: ask or work
+
+    alt ask
+        Bridge->>Channel: answer
+    else work
+        Bridge->>Claude: message + name prompt
+        Claude-->>Bridge: title, description
+        Bridge->>Multica: create issue(title, description)
+        Multica-->>Bridge: issue key, url
+        Bridge->>Channel: link, ticket reaction
+        Bridge->>Claude: phase todo
+        Claude-->>Bridge: work
+        loop status unchanged and gate continues
+            Bridge->>Claude: same phase task
+            Claude-->>Bridge: work
+            Bridge->>Multica: read status
+        end
+        Bridge->>Claude: task for the new status
+    end
+```
+
+```text
+intake(message)
+  kind = classify(message)          # Fastino: ask | work
+  if kind == ask: queue answer
+  if kind == work:
+      draft = agent.write(message, name_prompt)
+      require draft.title and draft.description
+      issue = multica.create(draft.title, draft.description)
+      link(issue, channel, root, event)   # post_placement: thread or channel
+      react(ticket)
+      agent.work(phase(todo))
+      while status is unchanged and gate(status) continues:
+          agent.work(phase(status))
+          status = multica.status(issue)
+      agent.work(phase(new status))     # in_review, blocked, and done once
+```
+
 ```
 Buzz Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
                                                │
@@ -380,6 +430,37 @@ The harness works with any agent that implements the [ACP spec](https://agentcli
 - Return a `stopReason` (`end_turn`, `cancelled`, `max_tokens`, etc.)
 
 Set `BUZZ_ACP_AGENT_COMMAND` and `BUZZ_ACP_AGENT_ARGS` to point at your agent binary.
+
+## Good Shepherd Insights deployment (live)
+
+Self-hosted relay at `wss://relay.internal.goodshepherdinsights.com`
+(compose project `buzz-prod`, deploy dir `~/Documents/codes/buzz-relay/`,
+Cloudflare tunnel `buzz-relay-tunnel.service`). Admin console:
+`https://admin.internal.goodshepherdinsights.com` (`BUZZ_ADMIN_HOST`, operator
+roster in `RELAY_OPERATOR_PUBKEYS`). Membership gate: NIP-42 (WS) / NIP-98
+(HTTP); no invite codes needed for operator-minted `v2.` invite links
+(`POST /api/invites`, owner/admin only).
+
+Identities on this community (2026-10-07):
+
+| Role | Name | Pubkey |
+|---|---|---|
+| relay owner (identity) | relay | `97f5042e91a386e539abf579a99f1f74e077d28a5a3ab699ab117c80ed7efbaf` |
+| admin (human) | Nite | `f7be048aacf39b35b5a26a3db143fe8ad6b96b098c69d2073997e9ac05267ec4` |
+| admin (agent) | Eddify | `afe126622a3a21b53505b6d457ed04964c29992f6cf442d66dc099cb23441042` |
+| member (agent) | Alpha | `6ca301a3672a426a975fdbe08d1d0ebb71baefbb1143295f34d755767df76d92` |
+
+Eddify's ACP runs from `~/.config/buzz-agent/` (env + `buzz-acp.settings.toml`
++ heartbeat prompt, 0600); the goal loop points at Multica workspace
+`bc24b790-8a8d-4037-8015-60dcc2891c87` (Maryland Insights); `agent_id` still to
+be set. Host-binding rule: the relay rejects any request whose `Host` header is
+not exactly `relay.internal.goodshepherdinsights.com` (IP/LAN access yields
+`HTTP error: 404` on the wire). Pairing QRs embed the desktop's relay URL - set
+the desktop to the internal relay BEFORE pairing.
+
+This deployment runs the PR #1 goal loop (this branch), replacing the stock
+`main` binary. Built from a clean worktree of this repo per install; the
+settings/env in-tree here are the live values with secrets kept 0600.
 
 ## Testing
 

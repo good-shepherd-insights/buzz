@@ -15,8 +15,6 @@ use std::{
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-const OBSERVER_BUFFER_CAP: usize = 1_000;
-
 /// Best-effort metadata attached to observer events.
 #[derive(Clone, Debug, Default)]
 pub struct ObserverContext {
@@ -43,11 +41,12 @@ struct ObserverInner {
 }
 
 fn new_observer_handle() -> ObserverHandle {
-    let (tx, _) = broadcast::channel(OBSERVER_BUFFER_CAP);
+    let buffer_cap = crate::settings::get().observer.buffer_cap;
+    let (tx, _) = broadcast::channel(buffer_cap);
     ObserverHandle {
         inner: Arc::new(ObserverInner {
             tx,
-            buffer: Mutex::new(VecDeque::with_capacity(OBSERVER_BUFFER_CAP)),
+            buffer: Mutex::new(VecDeque::with_capacity(buffer_cap)),
             seq: AtomicU64::new(1),
         }),
     }
@@ -122,7 +121,7 @@ impl ObserverHandle {
 
         match self.inner.buffer.lock() {
             Ok(mut buffer) => {
-                if buffer.len() >= OBSERVER_BUFFER_CAP {
+                if buffer.len() >= crate::settings::get().observer.buffer_cap {
                     buffer.pop_front();
                 }
                 buffer.push_back(event.clone());

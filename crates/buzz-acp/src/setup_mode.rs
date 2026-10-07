@@ -6,7 +6,7 @@
 //! early-branch path:
 //!
 //! ```text
-//! Config::from_cli()
+//! Config::from_args()
 //!   └─ SetupPayload::from_env()?
 //!        ├─ Some(payload) → run_setup_listener(config, payload)  [this module]
 //!        └─ None          → normal pool path (unchanged)
@@ -123,77 +123,60 @@ pub(crate) enum RequirementPayload {
 impl RequirementPayload {
     /// Human-readable instruction fragment for the nudge copy.
     fn instruction(&self) -> String {
+        use crate::settings::render;
+        let t = &crate::settings::get().setup_mode;
+        let harness_of = |probe_args: &[String]| {
+            probe_args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| t.harness_fallback.clone())
+        };
         match self {
             RequirementPayload::NormalizedField { field } => {
-                format!("set the **{}** field in Edit Agent dropdowns", field)
+                render(&t.instruction_normalized_field, &[("field", field)])
             }
-            RequirementPayload::EnvKey { key } => {
-                format!("set `{}` in Edit Agent → Environment variables", key)
-            }
+            RequirementPayload::EnvKey { key } => render(&t.instruction_env_key, &[("key", key)]),
             RequirementPayload::CliLogin {
                 setup_copy,
                 availability,
                 probe_args,
             } => match availability {
                 AcpAvailabilityStatus::Available => setup_copy.clone(),
-                AcpAvailabilityStatus::AdapterMissing => {
-                    let harness = probe_args
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("the agent");
-                    format!(
-                        "install the {} ACP adapter (open Agent runtimes in Settings to diagnose)",
-                        harness
-                    )
-                }
-                AcpAvailabilityStatus::AdapterOutdated => {
-                    let harness = probe_args
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("the agent");
-                    format!(
-                        "reinstall the {} ACP adapter — the installed version is outdated (open Agent runtimes in Settings to diagnose)",
-                        harness
-                    )
-                }
-                AcpAvailabilityStatus::CliMissing => {
-                    let harness = probe_args
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("the agent");
-                    format!(
-                        "install {} CLI (open Agent runtimes in Settings to diagnose)",
-                        harness
-                    )
-                }
-                AcpAvailabilityStatus::NotInstalled => {
-                    let harness = probe_args
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("the agent");
-                    format!(
-                        "install {} (open Agent runtimes in Settings to diagnose)",
-                        harness
-                    )
-                }
+                AcpAvailabilityStatus::AdapterMissing => render(
+                    &t.instruction_adapter_missing,
+                    &[("harness", &harness_of(probe_args))],
+                ),
+                AcpAvailabilityStatus::AdapterOutdated => render(
+                    &t.instruction_adapter_outdated,
+                    &[("harness", &harness_of(probe_args))],
+                ),
+                AcpAvailabilityStatus::CliMissing => render(
+                    &t.instruction_cli_missing,
+                    &[("harness", &harness_of(probe_args))],
+                ),
+                AcpAvailabilityStatus::NotInstalled => render(
+                    &t.instruction_not_installed,
+                    &[("harness", &harness_of(probe_args))],
+                ),
             },
             RequirementPayload::CliConfigInvalid {
                 probe_args,
                 diagnostic,
                 ..
             } => {
-                let cli = probe_args.first().map(String::as_str).unwrap_or("the CLI");
-                let config_file = format!("~/.{}/config.toml", cli);
-                format!(
-                    "{} is invalid: {} — fix the config and restart the agent",
-                    config_file, diagnostic
+                let cli = probe_args
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| t.cli_fallback.clone());
+                let config_file = render(&t.config_file_template, &[("cli", &cli)]);
+                render(
+                    &t.instruction_config_invalid,
+                    &[("config_file", &config_file), ("diagnostic", diagnostic)],
                 )
             }
-            RequirementPayload::GitBash => {
-                "install Git for Windows (open Agent runtimes in Settings to diagnose)".to_string()
-            }
+            RequirementPayload::GitBash => t.instruction_git_bash.clone(),
             RequirementPayload::MissingBinary { command } => {
-                format!("install `{command}` or add it to PATH")
+                render(&t.instruction_missing_binary, &[("command", command)])
             }
         }
     }
@@ -247,16 +230,19 @@ impl SetupPayload {
     ///    payload as JSON. The desktop client parses this block to render a
     ///    `ConfigNudgeCard`; clients that don't understand it see a code block.
     fn nudge_body(&self) -> String {
+        let t = &crate::settings::get().setup_mode;
         let prose = if self.requirements.is_empty() {
-            format!(
-                "**{}** needs configuration before it can respond. Open Edit Agent to configure it.",
-                self.agent_name,
+            crate::settings::render(
+                &t.prose_no_requirements,
+                &[("agent_name", &self.agent_name)],
             )
         } else {
             let steps: Vec<String> = self
                 .requirements
                 .iter()
-                .map(|r| format!("- {}", r.instruction()))
+                .map(|r| {
+                    crate::settings::render(&t.step_template, &[("instruction", &r.instruction())])
+                })
                 .collect();
 
             let has_doctor_requirement = self
@@ -277,26 +263,28 @@ impl SetupPayload {
                 .any(|r| matches!(r, RequirementPayload::CliConfigInvalid { .. }));
 
             let footer = if has_doctor_requirement {
-                "Open Agent runtimes in Settings, install Git for Windows, then re-check and restart the agent.".to_string()
+                t.footer_git_bash.clone()
             } else if all_missing_binary {
-                "Install the missing binary or update PATH, then restart Buzz.".to_string()
+                t.footer_missing_binary.clone()
             } else if all_external {
                 // All requirements are external config files — Edit Agent cannot
                 // help. Don't send the user there.
-                "Fix the config file(s) and restart the agent.".to_string()
+                t.footer_all_external.clone()
             } else if any_external {
                 // Mixed: some Buzz-managed fields, some external config.
-                "Open Edit Agent in the Buzz app for the Buzz-managed fields; fix the external CLI config files manually and restart the agent.".to_string()
+                t.footer_mixed.clone()
             } else {
                 // All Buzz-managed — original footer unchanged.
-                "Open Edit Agent in the Buzz app to set these.".to_string()
+                t.footer_all_managed.clone()
             };
 
-            format!(
-                "**{}** needs configuration before it can respond:\n{}\n\n{}",
-                self.agent_name,
-                steps.join("\n"),
-                footer,
+            crate::settings::render(
+                &t.prose_with_requirements,
+                &[
+                    ("agent_name", &self.agent_name),
+                    ("steps", &steps.join("\n")),
+                    ("footer", &footer),
+                ],
             )
         };
 
@@ -738,6 +726,7 @@ mod tests {
 
     #[test]
     fn setup_payload_from_raw_returns_none_when_absent() {
+        crate::settings::init_for_tests();
         // None → Ok(None): normal startup, no setup payload.
         let result = SetupPayload::from_raw_env_value(None).unwrap();
         assert!(result.is_none());
@@ -745,6 +734,7 @@ mod tests {
 
     #[test]
     fn setup_payload_from_raw_returns_none_on_empty_string() {
+        crate::settings::init_for_tests();
         // Empty string → Ok(None): treated the same as absent.
         let result = SetupPayload::from_raw_env_value(Some(String::new())).unwrap();
         assert!(result.is_none());
@@ -752,6 +742,7 @@ mod tests {
 
     #[test]
     fn setup_payload_from_raw_returns_err_on_malformed_json() {
+        crate::settings::init_for_tests();
         // Malformed JSON → Err: no global env mutation, safe to run concurrently.
         let result = SetupPayload::from_raw_env_value(Some("not-valid-json{{{".into()));
         assert!(result.is_err(), "malformed JSON must return Err");
@@ -759,6 +750,7 @@ mod tests {
 
     #[test]
     fn setup_payload_deserializes_correctly() {
+        crate::settings::init_for_tests();
         let json = r#"{
             "agent_name": "Fizz",
             "agent_pubkey": "aabbccddeeff0011",
@@ -774,6 +766,7 @@ mod tests {
 
     #[test]
     fn setup_payload_deserializes_git_bash_requirement() {
+        crate::settings::init_for_tests();
         let payload: SetupPayload = serde_json::from_str(
             r#"{"agent_name":"Buzz Agent","agent_pubkey":"test","requirements":[{"surface":"git_bash"}]}"#,
         )
@@ -786,6 +779,7 @@ mod tests {
 
     #[test]
     fn setup_payload_deserializes_missing_binary_requirement() {
+        crate::settings::init_for_tests();
         let payload = SetupPayload::from_raw_env_value(Some(
             r#"{"agent_name":"Carol","agent_pubkey":"test","requirements":[{"surface":"missing_binary","command":"buzz-pi-acp"}]}"#.to_string(),
         ))
@@ -803,6 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_workflow_nudge_mentions_effective_owner_not_relay_signer() {
+        crate::settings::init_for_tests();
         let agent_keys = nostr::Keys::generate();
         let relay_keys = nostr::Keys::generate();
         let workflow_owner = nostr::Keys::generate().public_key().to_hex();
@@ -983,6 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_listener_nudges_threaded_edit_at_original_root() {
+        crate::settings::init_for_tests();
         let root = "77".repeat(32);
         let original = crate::edit_routing::test_support::message(Some(&root));
         let (edit, nudge) =
@@ -997,6 +993,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_listener_nudges_top_level_edit_at_original() {
+        crate::settings::init_for_tests();
         let original = crate::edit_routing::test_support::message(None);
         let original_id = original.id.to_hex();
         let (edit, nudge) = nudge_for_edit(&original_id, serde_json::json!([original])).await;
@@ -1010,6 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_listener_nudges_unresolved_edit_at_top_level() {
+        crate::settings::init_for_tests();
         // The target may itself be a thread reply; claiming it as root would
         // make the relay reject the nudge for mismatched ancestry.
         let target = "88".repeat(32);
@@ -1019,6 +1017,7 @@ mod tests {
 
     #[test]
     fn setup_listener_gate_rejects_unmentioned_and_self_edits() {
+        crate::settings::init_for_tests();
         let agent_keys = nostr::Keys::generate();
         let agent = agent_keys.public_key().to_hex();
         let target = "99".repeat(32);
@@ -1049,6 +1048,7 @@ mod tests {
     /// an edit that does not.
     #[tokio::test]
     async fn setup_rules_admit_only_edits_that_mention_the_agent() {
+        crate::settings::init_for_tests();
         let agent = nostr::Keys::generate().public_key().to_hex();
         let rules = default_setup_rules();
         let channel_id = Uuid::new_v4();
@@ -1079,6 +1079,7 @@ mod tests {
 
     #[test]
     fn nudge_body_names_all_requirements() {
+        crate::settings::init_for_tests();
         let payload = SetupPayload {
             agent_name: "Fizz".to_string(),
             agent_pubkey: "test".to_string(),
@@ -1105,6 +1106,7 @@ mod tests {
 
     #[test]
     fn nudge_body_codex_copy_does_not_mention_openai_api_key() {
+        crate::settings::init_for_tests();
         let payload = SetupPayload {
             agent_name: "Codex".to_string(),
             agent_pubkey: "test".to_string(),
@@ -1131,6 +1133,7 @@ mod tests {
 
     #[test]
     fn nudge_body_runtime_install_copy_points_to_agent_runtimes() {
+        crate::settings::init_for_tests();
         for availability in [
             AcpAvailabilityStatus::AdapterMissing,
             AcpAvailabilityStatus::AdapterOutdated,
@@ -1160,6 +1163,7 @@ mod tests {
 
     #[test]
     fn nudge_body_git_bash_copy_points_to_agent_runtimes() {
+        crate::settings::init_for_tests();
         let payload = SetupPayload {
             agent_name: "Buzz Agent".to_string(),
             agent_pubkey: "test".to_string(),
@@ -1178,6 +1182,7 @@ mod tests {
 
     #[test]
     fn nudge_body_empty_requirements_falls_back_to_generic() {
+        crate::settings::init_for_tests();
         let payload = SetupPayload {
             agent_name: "Fizz".to_string(),
             agent_pubkey: "test".to_string(),
@@ -1200,6 +1205,7 @@ mod tests {
 
     #[test]
     fn nudge_body_all_config_invalid_omits_edit_agent_footer() {
+        crate::settings::init_for_tests();
         // An all-CliConfigInvalid requirements list must NOT send users to
         // Edit Agent (which cannot fix an external config file).
         let payload = SetupPayload {
@@ -1227,6 +1233,7 @@ mod tests {
 
     #[test]
     fn nudge_body_mixed_requirements_uses_split_footer() {
+        crate::settings::init_for_tests();
         // Mixed list: one Buzz-managed env key + one external config invalid.
         // Footer must address both sides.
         let payload = SetupPayload {
@@ -1252,6 +1259,7 @@ mod tests {
 
     #[test]
     fn nudge_body_all_buzz_managed_retains_original_footer() {
+        crate::settings::init_for_tests();
         // Pure Buzz-managed requirements → original "Open Edit Agent" footer unchanged.
         let payload = SetupPayload {
             agent_name: "Fizz".to_string(),
@@ -1271,6 +1279,7 @@ mod tests {
 
     #[test]
     fn nudge_body_contains_sentinel_block() {
+        crate::settings::init_for_tests();
         // The body must end with a ```buzz:config-nudge fence so the desktop
         // can detect and strip it before rendering the ConfigNudgeCard.
         let payload = SetupPayload {
@@ -1293,6 +1302,7 @@ mod tests {
 
     #[test]
     fn nudge_body_sentinel_round_trips_payload() {
+        crate::settings::init_for_tests();
         // The JSON inside the sentinel block must deserialize back to an
         // equivalent SetupPayload (same agent_name and requirements).
         let payload = SetupPayload {
@@ -1336,6 +1346,7 @@ mod tests {
 
     #[test]
     fn nudge_body_prose_still_present_with_sentinel() {
+        crate::settings::init_for_tests();
         // Existing prose checks must pass — the sentinel is APPENDED, not a
         // replacement, so all prior `body.contains(...)` invariants hold.
         let payload = SetupPayload {
@@ -1376,6 +1387,7 @@ mod tests {
 
     #[test]
     fn test_unmatched_filter_returns_no_nudge() {
+        crate::settings::init_for_tests();
         let mut dedup: HashSet<EventId> = HashSet::new();
         let event_id = fake_event_id(0xAA);
 
@@ -1390,6 +1402,7 @@ mod tests {
 
     #[test]
     fn test_same_event_id_twice_nudges_exactly_once() {
+        crate::settings::init_for_tests();
         // The first call with a given event-id should return true; the second
         // call with the identical id must return false (replay dedup).
         let mut dedup: HashSet<EventId> = HashSet::new();
@@ -1442,6 +1455,7 @@ mod tests {
 
     #[test]
     fn cli_login_availability_available_survives_sentinel_round_trip() {
+        crate::settings::init_for_tests();
         let raw = make_desktop_cli_login_json("available");
         let payload = SetupPayload::from_raw_env_value(Some(raw))
             .unwrap()
@@ -1456,6 +1470,7 @@ mod tests {
 
     #[test]
     fn cli_login_availability_adapter_missing_survives_sentinel_round_trip() {
+        crate::settings::init_for_tests();
         let raw = make_desktop_cli_login_json("adapter_missing");
         let payload = SetupPayload::from_raw_env_value(Some(raw))
             .unwrap()
@@ -1470,6 +1485,7 @@ mod tests {
 
     #[test]
     fn cli_login_availability_cli_missing_survives_sentinel_round_trip() {
+        crate::settings::init_for_tests();
         let raw = make_desktop_cli_login_json("cli_missing");
         let payload = SetupPayload::from_raw_env_value(Some(raw))
             .unwrap()
@@ -1484,6 +1500,7 @@ mod tests {
 
     #[test]
     fn cli_login_availability_not_installed_survives_sentinel_round_trip() {
+        crate::settings::init_for_tests();
         let raw = make_desktop_cli_login_json("not_installed");
         let payload = SetupPayload::from_raw_env_value(Some(raw))
             .unwrap()

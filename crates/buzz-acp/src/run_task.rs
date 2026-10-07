@@ -9,9 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::{io::Write, time::Duration};
 use tokio::io::AsyncReadExt;
 
-const MAX_TASK_BYTES: u64 = 1024 * 1024;
-const INPUT_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Parser)]
 #[command(
     name = "buzz-acp run",
@@ -43,7 +40,7 @@ impl Task {
             return Err("unsupported_task_version");
         }
         if task.task_id.is_empty()
-            || task.task_id.len() > 256
+            || task.task_id.len() > crate::settings::get().run_task.task_id_max_len
             || task.task_id.chars().any(char::is_control)
             || task.task_id.trim().is_empty()
             || task.prompt.trim().is_empty()
@@ -88,26 +85,28 @@ async fn read_task(source: &str) -> Result<Task, &'static str> {
     if source.contains("://") {
         return Err("remote_task_not_supported");
     }
+    let settings = &crate::settings::get().run_task;
+    let max_task_bytes = settings.max_task_bytes;
     let mut bytes = Vec::new();
     let read = async {
         if source == "-" {
             tokio::io::stdin()
-                .take(MAX_TASK_BYTES + 1)
+                .take(max_task_bytes + 1)
                 .read_to_end(&mut bytes)
                 .await
         } else {
             tokio::fs::File::open(source)
                 .await?
-                .take(MAX_TASK_BYTES + 1)
+                .take(max_task_bytes + 1)
                 .read_to_end(&mut bytes)
                 .await
         }
     };
-    tokio::time::timeout(INPUT_TIMEOUT, read)
+    tokio::time::timeout(settings.input_timeout_secs, read)
         .await
         .map_err(|_| "task_input_timeout")?
         .map_err(|_| "task_read_failed")?;
-    if bytes.len() as u64 > MAX_TASK_BYTES {
+    if bytes.len() as u64 > max_task_bytes {
         return Err("task_too_large");
     }
     Task::parse(&bytes)
@@ -137,11 +136,14 @@ pub(crate) async fn run() -> i32 {
         }
         Err(_) => return emit(Terminal::new("invalid", Some("invalid_arguments")), 2),
     };
+    if crate::settings::init_from(args.launch.settings_file.as_deref()).is_err() {
+        return emit(Terminal::new("invalid", Some("invalid_settings")), 2);
+    }
     // These settings belong only to conversation admission and repeated work.
-    args.launch.heartbeat_interval = 0;
+    args.launch.heartbeat_interval = Some(0);
     args.launch.heartbeat_prompt = None;
     args.launch.heartbeat_prompt_file = None;
-    args.launch.turn_liveness_secs = 0;
+    args.launch.turn_liveness_secs = Some(0);
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
     // Register before configuration: launch prompt files can also block on I/O.
     #[cfg(unix)]
@@ -171,7 +173,7 @@ pub(crate) async fn run() -> i32 {
     let config = tokio::select! {
         biased;
         code = &mut signal_rx => return emit(Terminal::new("cancelled", None), code.unwrap_or(1)),
-        result = tokio::time::timeout(INPUT_TIMEOUT, configuration) => match result {
+        result = tokio::time::timeout(crate::settings::get().run_task.input_timeout_secs, configuration) => match result {
             Ok(Ok(Ok(config))) if config.max_turn_duration_secs > 0 => config,
             Err(_) => {
                 signal_task.abort();

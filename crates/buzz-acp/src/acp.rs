@@ -22,13 +22,6 @@ use crate::usage::{
 #[path = "acp_frame_writer.rs"]
 mod frame_writer;
 
-/// Maximum allowed size of a single NDJSON line from the agent's stdout.
-/// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
-const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
-
-/// Package and binary name used by Buzz's Pi ACP fork.
-pub(crate) const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
-
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -151,7 +144,7 @@ pub struct AcpClient {
     /// Sole stdin writer; None after an interrupted/failed frame closes it.
     stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
-    /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
+    /// Uses `LinesCodec::new_with_max_length` to enforce `[acp] max_line_size_bytes` at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
     reader: FramedRead<ChildStdout, LinesCodec>,
     /// Monotonically increasing JSON-RPC request id counter.
@@ -175,6 +168,8 @@ pub struct AcpClient {
     /// Inherited by `cancel_with_cleanup` so the drain loop shares the same budget
     /// rather than starting a fresh timer (prevents double-jeopardy).
     current_hard_deadline: Option<tokio::time::Instant>,
+    /// Agent message text streamed since the last [`take_turn_text`](Self::take_turn_text).
+    turn_text: String,
     /// Optional local observer feed used by the desktop app.
     observer: Option<ObserverHandle>,
     /// Pool slot index for this agent process.
@@ -444,13 +439,17 @@ impl AcpClient {
                 let _ = self.child.start_kill();
             }
         }
-        // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
+        // Bounded wait: if the child doesn't exit in time after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+        let wait = crate::settings::get().acp.shutdown_wait_secs;
+        match tokio::time::timeout(wait, self.child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+            Err(_) => tracing::warn!(
+                wait_secs = wait.as_secs(),
+                "child did not exit after SIGKILL — abandoning"
+            ),
         }
     }
 
@@ -486,7 +485,9 @@ impl AcpClient {
         // so the version check below could inspect the wrong binary.
         let launch_prefixed = std::env::var_os(launch::PREFIX_ENV).is_some();
         let mut cmd = launch::command(command, args)?;
-        if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
+        if crate::config::normalize_agent_command_identity(command)
+            == crate::settings::get().acp.buzz_pi_acp_name
+        {
             if !args.iter().any(|arg| arg == "--") {
                 cmd.arg("--");
             }
@@ -531,7 +532,7 @@ impl AcpClient {
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        for (key, value) in crate::config::default_agent_env(command) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
@@ -586,14 +587,17 @@ impl AcpClient {
         // console-subsystem child process spawned from a GUI/non-console parent.
         configure_no_window(&mut cmd);
 
-        let standard_adapter =
-            match crate::config::normalize_agent_command_identity(command).as_str() {
-                "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
-                    Some(StandardAdapterKind::Claude)
-                }
-                "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
-                _ => None,
-            };
+        let standard_adapter = {
+            let acp_settings = &crate::settings::get().acp;
+            let identity = crate::config::normalize_agent_command_identity(command);
+            if acp_settings.claude_adapter_commands.contains(&identity) {
+                Some(StandardAdapterKind::Claude)
+            } else if acp_settings.codex_adapter_commands.contains(&identity) {
+                Some(StandardAdapterKind::Codex)
+            } else {
+                None
+            }
+        };
         cmd.envs(launch_env.iter().cloned());
         cmd.env_remove(launch::PREFIX_ENV);
         let claude_thinking_summaries = standard_adapter == Some(StandardAdapterKind::Claude)
@@ -618,12 +622,16 @@ impl AcpClient {
         Ok(Self {
             child,
             stdin: Some(stdin),
-            reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
+            reader: FramedRead::new(
+                stdout,
+                LinesCodec::new_with_max_length(crate::settings::get().acp.max_line_size_bytes),
+            ),
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
+            turn_text: String::new(),
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
@@ -795,7 +803,7 @@ impl AcpClient {
             serde_json::json!({
                 "sessionId": session_id,
                 "mode": "set",
-                "key": "buzz",
+                "key": crate::settings::get().acp.goose_system_prompt_key,
                 "text": text,
             }),
         )
@@ -963,6 +971,11 @@ impl AcpClient {
         self.steering_supported
     }
 
+    /// The agent message text streamed since the last call, cleared.
+    pub fn take_turn_text(&mut self) -> String {
+        std::mem::take(&mut self.turn_text)
+    }
+
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
     /// exclusive cumulative path; standard ACP prompt usage is used only when
     /// goose emitted nothing for this turn.
@@ -1040,10 +1053,12 @@ impl AcpClient {
     ) -> Result<StopReason, AcpError> {
         // Inherit the hard deadline from the timed-out turn so the drain loop
         // doesn't start a fresh timer (prevents double-jeopardy). If the original
-        // deadline is already expired or near-expired, grant a 30s floor so the
+        // deadline is already expired or near-expired, grant a floor so the
         // cancel notification has time to propagate and the agent can respond.
         let stored_deadline = self.current_hard_deadline.take();
-        let min_cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let acp_settings = &crate::settings::get().acp;
+        let min_cleanup_deadline =
+            tokio::time::Instant::now() + acp_settings.cancel_cleanup_min_secs;
         let hard_deadline = match stored_deadline {
             Some(d) if d > min_cleanup_deadline => d,
             Some(_) => {
@@ -1123,11 +1138,11 @@ impl AcpClient {
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
         tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
-        // Use a fixed 30s idle timeout during cleanup — the cancel notification
+        // Use a fixed idle timeout during cleanup — the cancel notification
         // needs time to propagate and the agent may go silent while winding down.
         // The separate hard_deadline bounds agents that keep producing output
         // but ignore cancellation.
-        let cleanup_idle = std::time::Duration::from_secs(30);
+        let cleanup_idle = crate::settings::get().acp.cancel_cleanup_idle_secs;
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
@@ -1145,32 +1160,29 @@ impl AcpClient {
 
     /// Serialize `value` as a single NDJSON line and flush to the agent's stdin.
     ///
-    /// Bounded by a 30-second write timeout. If the agent stops reading stdin
+    /// Bounded by `[acp] write_timeout_secs`. If the agent stops reading stdin
     /// (e.g., it's stuck or dead), the write would otherwise block forever.
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
-        const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let write_timeout = crate::settings::get().acp.write_timeout_secs;
         let line = serde_json::to_string(value)?;
         tokio::time::timeout(
-            WRITE_TIMEOUT,
+            write_timeout,
             frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
         )
         .await
-        .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
+        .map_err(|_| AcpError::WriteTimeout(write_timeout))?
         .map_err(AcpError::Io)?;
         self.observe("acp_write", value.clone());
         Ok(())
     }
-
-    /// Default timeout for non-prompt RPCs (initialize, session/new, etc.).
-    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Send a JSON-RPC request and wait for the matching response.
     ///
     /// Assigns the next available id, writes the NDJSON line to stdin,
     /// then calls [`read_until_response`](Self::read_until_response).
     ///
-    /// The write phase is bounded by `WRITE_TIMEOUT` (30s) and the read phase
-    /// by `REQUEST_TIMEOUT` (60s), so worst-case wall clock is ~90s. Non-prompt
+    /// The write phase is bounded by `[acp] write_timeout_secs` and the read phase
+    /// by `[acp] request_timeout_secs` (the timeout for non-prompt RPCs). Non-prompt
     /// RPCs like `initialize` and `session/new` should complete in seconds;
     /// if they don't, the agent is likely stuck and we must not block forever.
     async fn send_request(
@@ -1193,7 +1205,7 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
+        let timeout = crate::settings::get().acp.request_timeout_secs;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
@@ -1273,7 +1285,7 @@ impl AcpClient {
         expected_id: u64,
     ) -> Result<serde_json::Value, AcpError> {
         loop {
-            // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
+            // LinesCodec::new_with_max_length enforces `[acp] max_line_size_bytes` at the
             // read level — the buffer never grows beyond the limit, preventing
             // OOM from rogue agents writing infinite non-newline bytes.
             let line = match self.reader.next().await {
@@ -1461,7 +1473,7 @@ impl AcpClient {
                 }
             }
 
-            // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
+            // LinesCodec::new_with_max_length enforces `[acp] max_line_size_bytes` at the
             // read level — the buffer never grows beyond the limit.
             let read_result = tokio::select! {
                 biased;
@@ -1836,6 +1848,7 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    self.turn_text.push_str(text);
                 }
                 false
             }
@@ -2417,9 +2430,15 @@ fn kill_process_group(_pid: u32) -> bool {
     false
 }
 
-/// First Claude Code release with `--thinking-display`. Older CLIs exit on
-/// unknown flags, so sending it to them would fail every `session/new`.
-const CLAUDE_THINKING_DISPLAY_MIN_VERSION: (u64, u64, u64) = (2, 1, 94);
+/// First Claude Code release with `--thinking-display` (`[acp]
+/// claude_thinking_display_min_version`). Older CLIs exit on unknown flags, so
+/// sending it to them would fail every `session/new`.
+fn claude_thinking_display_min_version() -> (u64, u64, u64) {
+    let [major, minor, patch] = crate::settings::get()
+        .acp
+        .claude_thinking_display_min_version;
+    (major, minor, patch)
+}
 
 /// Parse `claude --version` output such as `2.1.284 (Claude Code)`. The
 /// first word must be exactly three dot-separated digit runs.
@@ -2458,10 +2477,12 @@ async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> b
     version_cmd.arg("--version");
     configure_version_probe(&mut version_cmd);
     let version = match version_cmd.spawn() {
-        Ok(child) => claude_version_within(child, std::time::Duration::from_secs(5)).await,
+        Ok(child) => {
+            claude_version_within(child, crate::settings::get().acp.claude_version_probe_secs).await
+        }
         Err(_) => None,
     };
-    let accepts = version.is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION);
+    let accepts = version.is_some_and(|v| v >= claude_thinking_display_min_version());
     tracing::debug!(
         target: "acp::spawn",
         "{executable:?} --version = {version:?}; thinking summaries requested: {accepts}"
@@ -2488,12 +2509,12 @@ async fn claude_version_within(
     limit: std::time::Duration,
 ) -> Option<(u64, u64, u64)> {
     use tokio::io::AsyncReadExt;
-    const MAX_VERSION_BYTES: u64 = 256;
+    let max_version_bytes = crate::settings::get().acp.max_version_bytes;
     let pid = child.id();
     let probe = async {
         let mut stdout = Vec::new();
         let pipe = child.stdout.take()?;
-        pipe.take(MAX_VERSION_BYTES)
+        pipe.take(max_version_bytes)
             .read_to_end(&mut stdout)
             .await
             .ok()?;
@@ -3199,6 +3220,7 @@ mod tests {
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
+        crate::settings::init_for_tests();
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
@@ -3206,6 +3228,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
+        crate::settings::init_for_tests();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -3237,6 +3260,7 @@ mod tests {
         var: &str,
         extra_env: &[(String, String)],
     ) -> String {
+        crate::settings::init_for_tests();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
@@ -3806,8 +3830,9 @@ mod tests {
 
     #[test]
     fn claude_version_gate_admits_only_cli_with_thinking_display() {
+        crate::settings::init_for_tests();
         let accepts = |out: &str| {
-            parse_claude_version(out).is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION)
+            parse_claude_version(out).is_some_and(|v| v >= claude_thinking_display_min_version())
         };
         assert!(!accepts("2.1.92 (Claude Code)"), "below the minimum");
         assert!(!accepts("1.0.100 (Claude Code)"), "older major");
@@ -3822,6 +3847,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_thinking_display_check_fails_closed_without_readable_cli() {
+        crate::settings::init_for_tests();
         let mut cmd = tokio::process::Command::new("true");
         cmd.env("CLAUDE_CODE_EXECUTABLE", "/nonexistent/claude");
         assert!(!claude_cli_accepts_thinking_display(&cmd).await);
@@ -3832,6 +3858,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_version_timeout_kills_launcher_children() {
+        crate::settings::init_for_tests();
         let dir = std::env::temp_dir().join(format!("buzz-acp-hang-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create dir");
         let pidfile = dir.join("child.pid");
@@ -3862,6 +3889,7 @@ mod tests {
     /// actually received.
     #[cfg(unix)]
     async fn claude_session_meta_with_cli(cli_body: &str) -> serde_json::Value {
+        crate::settings::init_for_tests();
         use std::os::unix::fs::PermissionsExt;
 
         let dir =

@@ -2,8 +2,6 @@
 //! Keep the existing IDs and cursor retirement rules; bound when work is sent.
 use super::*;
 
-pub(super) const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
-
 #[derive(Default)]
 pub(super) struct RecoverySchedule {
     next_attempt: Option<tokio::time::Instant>,
@@ -56,7 +54,8 @@ pub(super) async fn recover_one(
     }
     // Pace from the end of a potentially backpressured write. No catch-up burst.
     // The existing bounded write timeout and read/ping owner detect socket loss.
-    state.recovery.next_attempt = Some(tokio::time::Instant::now() + RECOVERY_INTERVAL);
+    state.recovery.next_attempt =
+        Some(tokio::time::Instant::now() + crate::settings::get().relay.recovery_interval_secs);
 }
 
 /// No timer or capacity waiter when another authority owns all pending loss.

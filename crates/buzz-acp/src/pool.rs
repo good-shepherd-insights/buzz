@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -43,17 +43,6 @@ use crate::queue::{
 };
 use crate::relay::{ChannelInfo, RestClient};
 use crate::scope::SessionScope;
-
-/// Window within which agent activity before a hard-cap death qualifies
-/// the turn as "recently active" (eligible for requeue instead of dead-letter).
-const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
-
-/// Maximum canonical thread roots remembered by one live ACP session.
-///
-/// Evicting the oldest root only causes a future prompt to include redundant
-/// context again; it cannot drop user-authored context, so bounded fail-open
-/// behavior is preferable to an ever-growing channel-policy session ledger.
-const MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE: usize = 1024;
 
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
@@ -242,7 +231,11 @@ impl SessionState {
             if delivery.hydrated_thread_roots.contains(&root) {
                 continue;
             }
-            if delivery.hydrated_thread_roots.len() >= MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE {
+            if delivery.hydrated_thread_roots.len()
+                >= crate::settings::get()
+                    .pool
+                    .max_hydrated_thread_roots_per_scope
+            {
                 delivery.hydrated_thread_roots.pop_front();
             }
             delivery.hydrated_thread_roots.push_back(root);
@@ -306,21 +299,16 @@ pub struct OwnedAgent {
     pub protocol_version: u32,
 }
 
-/// Package name reported by `claude-agent-acp` in its `initialize` response.
-/// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
-/// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
-/// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
-/// rename, so the new name is a reliable capability gate.
-const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
-
 fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
     goose_system_prompt_supported: Option<bool>,
 ) -> bool {
-    if agent_name == "goose" {
+    if agent_name == crate::settings::get().pool.goose_agent_name {
         goose_system_prompt_supported == Some(true)
-    } else if agent_name == BUZZ_PI_ACP_NAME || agent_name == CLAUDE_AGENT_ACP_NAME {
+    } else if agent_name == crate::settings::get().acp.buzz_pi_acp_name.as_str()
+        || agent_name == crate::settings::get().pool.claude_agent_acp_name.as_str()
+    {
         true
     } else {
         protocol_version >= 2
@@ -335,11 +323,13 @@ fn session_new_system_prompt<'a>(
 ) -> Option<SystemPromptTransport<'a>> {
     if is_goose {
         None
-    } else if agent_name == BUZZ_PI_ACP_NAME {
+    } else if agent_name == crate::settings::get().acp.buzz_pi_acp_name.as_str() {
         prompt.map(SystemPromptTransport::PiMeta)
-    } else if protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME {
+    } else if protocol_version < 2
+        && agent_name != crate::settings::get().pool.claude_agent_acp_name.as_str()
+    {
         None
-    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+    } else if agent_name == crate::settings::get().pool.claude_agent_acp_name.as_str() {
         prompt.map(SystemPromptTransport::ClaudeMeta)
     } else {
         prompt.map(SystemPromptTransport::Field)
@@ -436,6 +426,21 @@ impl PromptSource {
             Self::Heartbeat => None,
         }
     }
+}
+
+/// Model stops that still have to pass the issue stop guard. A token cap or a
+/// request cap is not permission to leave an open issue.
+fn stop_engages_goal_guard(reason: &StopReason) -> bool {
+    matches!(
+        reason,
+        StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests
+    )
+}
+
+/// Race 1 drops the completed prompt future. Synthesize the stop that answer
+/// delivery and the issue stop guard already handle: a normal end of turn.
+fn completed_before_control_stop() -> StopReason {
+    StopReason::EndTurn
 }
 
 /// Apply state effects for Race 1, where a control signal arrives just after the
@@ -703,7 +708,7 @@ pub enum TimeoutKind {
     Idle,
     /// Turn ran for `max_turn_duration` seconds of wall-clock time.
     /// `recently_active` is true when the agent produced output within
-    /// `RECENT_ACTIVITY_WINDOW` of the hard-cap firing.
+    /// `crate::settings::get().pool.recent_activity_window_secs` of the hard-cap firing.
     Hard { recently_active: bool },
 }
 
@@ -751,8 +756,6 @@ struct CachedProjectInfo {
 
 #[derive(Debug)]
 pub(crate) struct ProjectLookupError(String);
-
-const PROJECT_INFO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ChannelInfoResolver {
@@ -853,10 +856,9 @@ impl ChannelInfoResolver {
             .read()
             .ok()
             .and_then(|cache| cache.get(&channel_id).cloned());
-        if let Some(fresh) = cached
-            .as_ref()
-            .filter(|cached| cached.fetched_at.elapsed() < PROJECT_INFO_CACHE_TTL)
-        {
+        if let Some(fresh) = cached.as_ref().filter(|cached| {
+            cached.fetched_at.elapsed() < crate::settings::get().pool.project_info_cache_ttl_secs
+        }) {
             return Ok(fresh.value.clone());
         }
         let fetched = match fetch_project_home_for_channel(channel_id, &self.rest_client).await {
@@ -937,6 +939,10 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Goal loop; `None` leaves every turn untouched.
+    pub goal: Option<Arc<crate::goal::GoalRuntime>>,
+    /// Tells the main loop a continuation started, so it extends the turn deadline.
+    pub continuation_tx: Option<mpsc::UnboundedSender<SessionScope>>,
 }
 
 impl AgentPool {
@@ -1493,41 +1499,6 @@ pub enum IdleSwitchResult {
     NoIdleAgent,
 }
 
-/// Timeout for a single pre-prompt context fetch attempt (thread/DM history).
-/// Each call gets this budget; with one retry the total worst-case is
-/// 2 × CONTEXT_FETCH_TIMEOUT + CONTEXT_FETCH_RETRY_DELAY ≈ 6.5 s.
-const CONTEXT_FETCH_TIMEOUT: Duration = Duration::from_millis(3_000);
-
-/// Short, single-attempt timeout for best-effort exact truncated-thread counts.
-const CONTEXT_COUNT_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Delay between the first failed context fetch and the single retry.
-const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
-const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Bounded grace window for the post-cancel drain after a control-signal
-/// cancellation (steer fallback, interrupt, or explicit stop). This is a
-/// cleanup deadline, not the turn's configured max-turn wall clock — see
-/// [`AcpClient::cancel_with_cleanup_grace`] and
-/// [`classify_control_cancel_failure`].
-const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
-
-/// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
-const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Bounded window a `Thread` batch waits for its busy session-owner before we
-/// stop holding and fork a fresh session on an idle worker. Kept below the 30s
-/// maintenance tick so even a silent system re-evaluates a held batch shortly
-/// after expiry, versus the max-turn deadline it could starve behind today.
-pub(crate) const HOLD_BUSY_OWNER_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
-/// event carries no `name` tag. Not a real channel name — consumers that need
-/// an identifying name must treat it as absent.
-const UNKNOWN_CHANNEL_NAME: &str = "unknown";
-
 /// Channel-derived inputs for a new session — `(is_dm, title_channel)` — from
 /// **one** metadata resolve.
 ///
@@ -1536,8 +1507,8 @@ const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 /// session title is qualified with the channel name. Resolving once is
 /// load-bearing rather than tidy: [`ChannelInfoResolver`] caches only `Some`,
 /// so two calls against an unresolvable channel pay the whole
-/// [`fetch_channel_info`] retry sequence twice — two `CONTEXT_FETCH_TIMEOUT`
-/// attempts plus `CONTEXT_FETCH_RETRY_DELAY` each, in front of `session/new`,
+/// [`fetch_channel_info`] retry sequence twice — two `crate::settings::get().pool.context_fetch_timeout_ms`
+/// attempts plus `crate::settings::get().pool.context_fetch_retry_delay_ms` each, in front of `session/new`,
 /// precisely when the relay is already degraded.
 ///
 /// `title_channel` is `None` whenever the channel can't usefully identify the
@@ -1560,7 +1531,9 @@ async fn resolve_new_session_channel_context(
         return (true, None, None);
     };
     let is_dm = info.channel_type == "dm";
-    let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then(|| info.name.clone());
+    let title_channel = (!is_dm
+        && info.name != crate::settings::get().pool.unknown_channel_name.as_str())
+    .then(|| info.name.clone());
     (is_dm, title_channel, Some(info.channel_type.clone()))
 }
 
@@ -1590,7 +1563,7 @@ async fn create_session_and_apply_model(
     // the same content as user-message sections via `format_prompt`. Core carries
     // its own `<core-memory>` boundary, and canvas carries its own
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
-    let is_goose = agent.agent_name == "goose";
+    let is_goose = agent.agent_name == crate::settings::get().pool.goose_agent_name;
     let combined_system_prompt = with_canvas(
         with_huddle_instructions(
             with_core(
@@ -1857,7 +1830,7 @@ pub(crate) async fn run_isolated_prompt(
     let core = if ctx.memory_enabled {
         if let Some(owner) = &ctx.agent_owner_pubkey {
             tokio::time::timeout(
-                Duration::from_secs(3),
+                crate::settings::get().pool.core_fetch_timeout_secs,
                 crate::engram_fetch::build_core_section(&ctx.rest_client, &ctx.agent_keys, owner),
             )
             .await
@@ -1970,20 +1943,23 @@ async fn apply_model_switch(
         ModelSwitchMethod::SetModel { .. } => "set_model".to_string(),
     };
 
-    let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
-        match method {
-            ModelSwitchMethod::ConfigOption {
-                config_id,
-                option_value,
-            } => {
-                acp.session_set_config_option(session_id, config_id, option_value)
-                    .await
+    let result = tokio::time::timeout(
+        crate::settings::get().pool.model_switch_timeout_secs,
+        async {
+            match method {
+                ModelSwitchMethod::ConfigOption {
+                    config_id,
+                    option_value,
+                } => {
+                    acp.session_set_config_option(session_id, config_id, option_value)
+                        .await
+                }
+                ModelSwitchMethod::SetModel { model_id } => {
+                    acp.session_set_model(session_id, model_id).await
+                }
             }
-            ModelSwitchMethod::SetModel { model_id } => {
-                acp.session_set_model(session_id, model_id).await
-            }
-        }
-    })
+        },
+    )
     .await;
 
     match result {
@@ -2026,9 +2002,12 @@ async fn apply_model_switch(
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
                 target: "pool::model",
-                "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+                "model set via {method_label} timed out ({:?}) — treating as fatal",
+                crate::settings::get().pool.model_switch_timeout_secs
             );
-            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
+            Err(AcpError::Timeout(
+                crate::settings::get().pool.model_switch_timeout_secs,
+            ))
         }
     }
 }
@@ -2069,12 +2048,15 @@ async fn apply_startup_effort(
         return Ok(None);
     };
 
-    let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
-        agent
-            .acp
-            .session_set_config_option(session_id, &config_id, &value)
-            .await
-    })
+    let result = tokio::time::timeout(
+        crate::settings::get().pool.model_switch_timeout_secs,
+        async {
+            agent
+                .acp
+                .session_set_config_option(session_id, &config_id, &value)
+                .await
+        },
+    )
     .await;
 
     match result {
@@ -2111,9 +2093,12 @@ async fn apply_startup_effort(
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
                 target: "pool::effort",
-                "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+                "startup effort {value} via configId={config_id} timed out ({:?}) — treating as fatal",
+                crate::settings::get().pool.model_switch_timeout_secs
             );
-            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
+            Err(AcpError::Timeout(
+                crate::settings::get().pool.model_switch_timeout_secs,
+            ))
         }
     }
 }
@@ -2177,10 +2162,13 @@ async fn apply_permission_mode(
     mode: &PermissionMode,
 ) -> Result<(), AcpError> {
     let wire = mode.as_wire_str();
-    let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
-        acp.session_set_config_option(session_id, "mode", wire)
-            .await
-    })
+    let result = tokio::time::timeout(
+        crate::settings::get().pool.permission_mode_timeout_secs,
+        async {
+            acp.session_set_config_option(session_id, "mode", wire)
+                .await
+        },
+    )
     .await;
 
     match result {
@@ -2214,9 +2202,12 @@ async fn apply_permission_mode(
             // Outer timeout fired — stream may be in unknown state.
             tracing::error!(
                 target: "pool::permission",
-                "permission mode set timed out ({PERMISSION_MODE_TIMEOUT:?}) — treating as fatal"
+                "permission mode set timed out ({:?}) — treating as fatal",
+                crate::settings::get().pool.permission_mode_timeout_secs
             );
-            return Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT));
+            return Err(AcpError::Timeout(
+                crate::settings::get().pool.permission_mode_timeout_secs,
+            ));
         }
     }
     Ok(())
@@ -2316,7 +2307,7 @@ fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
     let core = core.map(|core| {
         crate::prompt_framing::normalize_semantic_section(
             "core-memory",
-            "Agent Memory — core",
+            &crate::settings::get().pool.legacy_core_label,
             core,
         )
     });
@@ -2546,6 +2537,8 @@ pub async fn run_prompt_task(
         prompt_dm.record(prompt_is_dm);
     }
 
+    let mut goal = crate::goal::GoalTurn::new(&ctx, &source, batch.as_ref());
+
     //
     // Core memory is delivered inside the system prompt the harness already
     // builds (system role for protocol >= 2, the `<agent-instructions>` user-message
@@ -2564,7 +2557,7 @@ pub async fn run_prompt_task(
     //   * transport / decrypt / parse error → inject nothing. We never
     //     mistake "relay slow or broken" for "no core" — that would invite
     //     the agent to overwrite real, just-unreachable memory.
-    //   * fetch exceeds CORE_FETCH_TIMEOUT → inject nothing, same reason.
+    //   * fetch exceeds crate::settings::get().pool.core_fetch_timeout_secs → inject nothing, same reason.
     //
     // Per Tyler's locked spec: NO mid-session refreshes. Re-fetch only
     // happens when a session is invalidated and recreated (see
@@ -2583,19 +2576,23 @@ pub async fn run_prompt_task(
             if is_new_channel_session && !agent.state.core_sections.contains_key(scope) {
                 // Bounded — we'd rather start the session with no core hint
                 // than block session creation on a stalled relay.
-                const CORE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
                 let fetch = crate::engram_fetch::build_core_section(
                     &ctx.rest_client,
                     &ctx.agent_keys,
                     owner_pk,
                 );
-                let section = match tokio::time::timeout(CORE_FETCH_TIMEOUT, fetch).await {
+                let section = match tokio::time::timeout(
+                    crate::settings::get().pool.core_fetch_timeout_secs,
+                    fetch,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(_) => {
                         tracing::warn!(
                             target: "engram::core",
                             channel = %cid,
-                            timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
+                            timeout_ms = crate::settings::get().pool.core_fetch_timeout_secs.as_millis() as u64,
                             "core fetch timed out — emitting no section"
                         );
                         None
@@ -2966,7 +2963,8 @@ pub async fn run_prompt_task(
                     return;
                 }
                 Err(AcpError::HardTimeout { silence }) => {
-                    let recently_active = silence < RECENT_ACTIVITY_WINDOW;
+                    let recently_active =
+                        silence < crate::settings::get().pool.recent_activity_window_secs;
                     tracing::error!(
                         target: "pool::session",
                         "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
@@ -3169,13 +3167,25 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
+    let goal_instructions = match goal.as_mut() {
+        Some(turn) => turn.opening_prompt().await,
+        None => None,
+    };
+    let mut prompt_blocks: Vec<&str> = match slash_command {
         Some(ref cmd) => std::iter::once(cmd.as_str())
             .chain(prompt_sections.iter().map(String::as_str))
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
-    let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
+    prompt_blocks.extend(goal_instructions.as_deref());
+    // A work mention's first prompt is the name prompt. The formatted prompt
+    // stays ready: a rejected name is answered as an ask on this session.
+    let name_blocks = goal.as_ref().and_then(crate::goal::GoalTurn::name_blocks);
+    let mut naming = name_blocks.is_some();
+    let prompt_bytes: usize = match &name_blocks {
+        Some((prompt, request)) => prompt.len() + request.len(),
+        None => prompt_blocks.iter().map(|block| block.len()).sum(),
+    };
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
@@ -3187,6 +3197,7 @@ pub async fn run_prompt_task(
         prompt_bytes,
         standing_context_included,
         delivered_event_delta = pending_delivered_event_ids.len(),
+        naming,
         "prompt context delivery"
     );
     agent.acp.observe(
@@ -3214,184 +3225,223 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
-    let prompt_result = match control_rx {
-        None => {
-            // Heartbeat / non-cancellable path.
-            tokio::select! {
-                biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
-                    &session_id,
-                    &prompt_blocks,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                ) => result,
+    // The stop guard may continue the session, so `control_rx` is polled by reference.
+    let mut control_rx = control_rx;
+    let mut continuation: Option<String> = None;
+    let mut turn_text = String::new();
+    let mut completed_before_control: Option<ControlSignal> = None;
+    let prompt_result = loop {
+        // Text streamed by an earlier prompt is not this prompt's response.
+        agent.acp.take_turn_text();
+        let blocks: Vec<&str> = match (&continuation, naming) {
+            (Some(text), _) => vec![text.as_str()],
+            (None, true) => match &name_blocks {
+                Some((prompt, request)) if !prompt.is_empty() => {
+                    vec![prompt.as_str(), request.as_str()]
+                }
+                Some((_, request)) => vec![request.as_str()],
+                None => prompt_blocks.clone(),
+            },
+            (None, false) => prompt_blocks.clone(),
+        };
+        let result = match control_rx.as_mut() {
+            None => {
+                // Heartbeat / non-cancellable path.
+                tokio::select! {
+                    biased;
+                    result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                        &session_id,
+                        &blocks,
+                        ctx.idle_timeout,
+                        ctx.max_turn_duration,
+                    ) => result,
+                }
             }
-        }
-        Some(rx) => {
-            tokio::select! {
-                biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
-                    &session_id,
-                    &prompt_blocks,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                ) => result,
-                mode = rx => {
-                    let control_signal = mode.unwrap_or(ControlSignal::Cancel);
-                    // Land the model switch before any cancel/requeue work: setting
-                    // `desired_model` here means the fresh session created by the
-                    // requeued turn (busy) or the next turn (already-completed)
-                    // applies the new model. Runtime-only — never persisted.
-                    if let ControlSignal::SwitchModel { model_id, request_id } = &control_signal {
-                        agent.desired_model = Some(model_id.clone());
-                        agent.model_overridden = true;
-                        agent.desired_model_request_id = request_id.clone();
-                        // Busy path: the real apply is deferred to the requeued
-                        // session. Arm the positive-terminal emit so that apply
-                        // reports success explicitly rather than the Desktop
-                        // inferring it from timeout silence.
-                        agent.desired_model_pending_ack = true;
-                    }
-                    // Control signal received. Guard against Race 1: the turn may
-                    // have completed naturally just as cancel fired.
-                    if agent.acp.has_in_flight_prompt() {
-                        // Prompt is genuinely in-flight — cancel it.
-                        match agent
-                            .acp
-                            .cancel_with_cleanup_grace(&session_id, CONTROL_CANCEL_GRACE)
-                            .await
-                        {
-                            Ok(stop_reason) => {
-                                log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
-                                let retry_batch =
-                                    requeue_cancelled_batch(&ctx, control_signal, batch);
-
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
-                                    &ctx,
-                                    usage,
-                                    observer_channel_id,
-                                    &session_id,
-                                    &turn_id,
-                                    Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
-                                )
-                                .await;
-                                send_prompt_result(
-                                    &result_tx,
-                                    &turn_id,
-                                    agent,
-                                    source,
-                                    PromptOutcome::Cancelled,
-                                    retry_batch,
-                                );
-                                return;
-                            }
-                            Err(error) => {
-                                // Single production arm: classify the error→outcome
-                                // and outcome→batch-fate boundary once via the seam
-                                // shared with tests, then invalidate/publish/send once.
-                                let failure = classify_control_cancel_failure(
-                                    &ctx,
-                                    error,
-                                    control_signal,
-                                    batch,
-                                );
-                                if failure.invalidate_all {
-                                    agent.state.invalidate_all();
-                                } else {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                        &session_id,
+                        &blocks,
+                        ctx.idle_timeout,
+                        ctx.max_turn_duration,
+                    ) => result,
+                    mode = rx => {
+                        let control_signal = mode.unwrap_or(ControlSignal::Cancel);
+                        // Land the model switch before any cancel/requeue work: setting
+                        // `desired_model` here means the fresh session created by the
+                        // requeued turn (busy) or the next turn (already-completed)
+                        // applies the new model. Runtime-only — never persisted.
+                        if let ControlSignal::SwitchModel { model_id, request_id } = &control_signal {
+                            agent.desired_model = Some(model_id.clone());
+                            agent.model_overridden = true;
+                            agent.desired_model_request_id = request_id.clone();
+                            // Busy path: the real apply is deferred to the requeued
+                            // session. Arm the positive-terminal emit so that apply
+                            // reports success explicitly rather than the Desktop
+                            // inferring it from timeout silence.
+                            agent.desired_model_pending_ack = true;
+                        }
+                        // Control signal received. Guard against Race 1: the turn may
+                        // have completed naturally just as cancel fired.
+                        if agent.acp.has_in_flight_prompt() {
+                            // Prompt is genuinely in-flight — cancel it.
+                            match agent
+                                .acp
+                                .cancel_with_cleanup_grace(&session_id, crate::settings::get().pool.control_cancel_grace_secs)
+                                .await
+                            {
+                                Ok(stop_reason) => {
+                                    log_stop_reason(&source, &stop_reason);
                                     agent.state.invalidate(&source);
-                                }
+                                    let retry_batch =
+                                        requeue_cancelled_batch(&ctx, control_signal, batch);
 
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
-                                    &ctx,
-                                    usage,
-                                    observer_channel_id,
-                                    &session_id,
-                                    &turn_id,
-                                    Some(buzz_core::agent_turn_metric::StopReason::Error),
-                                )
-                                .await;
-                                send_prompt_result(
-                                    &result_tx,
-                                    &turn_id,
-                                    agent,
-                                    source,
-                                    failure.outcome,
-                                    failure.retry_batch,
-                                );
-                                return;
+                                    let usage = agent.acp.take_turn_usage();
+                                    publish_agent_turn_metric(
+                                        &ctx,
+                                        usage,
+                                        observer_channel_id,
+                                        &session_id,
+                                        &turn_id,
+                                        Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+                                    )
+                                    .await;
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        PromptOutcome::Cancelled,
+                                        retry_batch,
+                                    );
+                                    return;
+                                }
+                                Err(error) => {
+                                    // Single production arm: classify the error→outcome
+                                    // and outcome→batch-fate boundary once via the seam
+                                    // shared with tests, then invalidate/publish/send once.
+                                    let failure = classify_control_cancel_failure(
+                                        &ctx,
+                                        error,
+                                        control_signal,
+                                        batch,
+                                    );
+                                    if failure.invalidate_all {
+                                        agent.state.invalidate_all();
+                                    } else {
+                                        agent.state.invalidate(&source);
+                                    }
+
+                                    let usage = agent.acp.take_turn_usage();
+                                    publish_agent_turn_metric(
+                                        &ctx,
+                                        usage,
+                                        observer_channel_id,
+                                        &session_id,
+                                        &turn_id,
+                                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                                    )
+                                    .await;
+                                    send_prompt_result(
+                                        &result_tx,
+                                        &turn_id,
+                                        agent,
+                                        source,
+                                        failure.outcome,
+                                        failure.retry_batch,
+                                    );
+                                    return;
+                                }
                             }
-                        }
-                    } else {
-                        // Race 1 resolution: turn completed naturally before cancel
-                        // could fire. last_prompt_id is None — cleared by
-                        // session_prompt_with_idle_timeout() on success. The prompt
-                        // future was dropped by select! — its Ok result is gone.
-                        //
-                        // Note: this `else` branch (last_prompt_id is None) cannot
-                        // fire during the pre-prompt phase because `biased` select!
-                        // polls the prompt arm first. That arm sets last_prompt_id
-                        // synchronously before its first yield point, so by the time
-                        // the cancel arm can win, last_prompt_id is already Some.
-                        // This branch only fires when the turn genuinely completed
-                        // and last_prompt_id was cleared by the success path.
-                        //
-                        // MUST send a PromptResult or the main loop deadlocks.
-                        if matches!(
-                            control_signal,
-                            ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
-                        ) {
-                            tracing::debug!(
-                                target: "pool::prompt",
-                                "rotate/switch signal arrived but turn already completed — invalidating session"
-                            );
                         } else {
-                            tracing::debug!(
-                                target: "pool::prompt",
-                                "control signal arrived but turn already completed — treating as success"
-                            );
+                            // Race 1 resolution: turn completed naturally before cancel
+                            // could fire. last_prompt_id is None — cleared by
+                            // session_prompt_with_idle_timeout() on success. The prompt
+                            // future was dropped by select! — its Ok result is gone.
+                            //
+                            // Note: this `else` branch (last_prompt_id is None) cannot
+                            // fire during the pre-prompt phase because `biased` select!
+                            // polls the prompt arm first. That arm sets last_prompt_id
+                            // synchronously before its first yield point, so by the time
+                            // the cancel arm can win, last_prompt_id is already Some.
+                            // This branch only fires when the turn genuinely completed
+                            // and last_prompt_id was cleared by the success path.
+                            //
+                            // MUST send a PromptResult or the main loop deadlocks.
+                            if matches!(
+                                control_signal,
+                                ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
+                            ) {
+                                tracing::debug!(
+                                    target: "pool::prompt",
+                                    "rotate/switch signal arrived but turn already completed — invalidating session"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "pool::prompt",
+                                    "control signal arrived but turn already completed — treating as success"
+                                );
+                            }
+                            // The prompt completed, but its ready result lost the
+                            // select race. Handle the synthetic EndTurn through the
+                            // normal completion path so answer delivery and the goal
+                            // stop guard are not skipped.
+                            completed_before_control = Some(control_signal);
+                            control_rx = None;
+                            Ok(completed_before_control_stop())
                         }
-                        log_stop_reason(&source, &StopReason::EndTurn);
-                        if let PromptSource::Channel(scope) = &source {
-                            let standing_sent = !agent.has_system_prompt_support();
-                            record_scope_delivery_success(
-                                &mut agent,
-                                scope.clone(),
-                                standing_sent,
-                                &pending_delivered_event_ids,
-                                &pending_hydrated_thread_roots,
-                            );
+                    }
+                }
+            }
+        };
+        if let Some(goal) = goal.as_mut() {
+            if let Ok(reason) = &result {
+                if naming {
+                    turn_text = agent.acp.take_turn_text();
+                    if let Some(named_batch) = batch.as_ref() {
+                        let accepted = if stop_engages_goal_guard(reason) {
+                            goal.accept_name(&ctx, named_batch, &turn_text).await
+                        } else if matches!(reason, StopReason::Refusal) {
+                            goal.reject_name(&ctx, named_batch).await;
+                            false
+                        } else {
+                            goal.drop_name();
+                            false
+                        };
+                        naming = false;
+                        if accepted {
+                            if let Some(text) = goal.phase_prompt() {
+                                if !text.is_empty() {
+                                    continuation = Some(text);
+                                    continue;
+                                }
+                            }
+                            if let Some(text) =
+                                goal.next_continuation(&ctx, &source, &turn_text).await
+                            {
+                                continuation = Some(text);
+                                continue;
+                            }
+                        } else if stop_engages_goal_guard(reason)
+                            || matches!(reason, StopReason::Refusal)
+                        {
+                            // The notice is already posted. Answer the queued
+                            // message as an ask. Do not post the naming reply.
+                            continuation = None;
+                            continue;
                         }
-                        apply_completed_before_control_signal(
-                            &mut agent.state,
-                            &source,
-                            &control_signal,
-                        );
-                        let usage = agent.acp.take_turn_usage();
-                        publish_agent_turn_metric(
-                            &ctx,
-                            usage,
-                            observer_channel_id,
-                            &session_id,
-                            &turn_id,
-                            Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
-                        )
-                        .await;
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Ok(StopReason::EndTurn),
-                            None, // turn succeeded — batch was processed, no requeue
-                        );
-                        return;
+                    }
+                } else if stop_engages_goal_guard(reason) {
+                    turn_text = agent.acp.take_turn_text();
+                    if let Some(text) = goal.next_continuation(&ctx, &source, &turn_text).await {
+                        continuation = Some(text);
+                        continue;
                     }
                 }
             }
         }
+        break result;
     };
 
     match prompt_result {
@@ -3409,6 +3459,16 @@ pub async fn run_prompt_task(
                 );
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
+            }
+
+            if let Some(control_signal) = completed_before_control.take() {
+                apply_completed_before_control_signal(&mut agent.state, &source, &control_signal);
+            }
+
+            if let (Some(goal), Some(batch), StopReason::EndTurn) =
+                (goal.as_ref(), batch.as_ref(), &stop_reason)
+            {
+                goal.deliver_answer(&ctx, batch, &turn_text).await;
             }
 
             let should_rotate = matches!(
@@ -3574,7 +3634,7 @@ pub async fn run_prompt_task(
             }
         }
         Err(AcpError::HardTimeout { silence }) => {
-            let recently_active = silence < RECENT_ACTIVITY_WINDOW;
+            let recently_active = silence < crate::settings::get().pool.recent_activity_window_secs;
             tracing::error!(
                 target: "pool::prompt",
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
@@ -3631,7 +3691,7 @@ pub async fn run_prompt_task(
     // _reaction_guard drops here → spawns clear_reactions for all exit paths.
 }
 
-/// Retry wrapper for context fetches: one retry with `CONTEXT_FETCH_RETRY_DELAY`
+/// Retry wrapper for context fetches: one retry with `crate::settings::get().pool.context_fetch_retry_delay_ms`
 /// on any `None` result. The closure is called twice at most.
 ///
 /// Using a closure (not a `Future`) so the retry can construct a fresh `Future`
@@ -3641,17 +3701,23 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
+    let pool = &crate::settings::get().pool;
     if let Some(result) = f().await {
         return Some(result);
     }
-    tokio::time::sleep(CONTEXT_FETCH_RETRY_DELAY).await;
-    f().await
+    for _ in 0..pool.context_fetch_retries {
+        tokio::time::sleep(pool.context_fetch_retry_delay_ms).await;
+        if let Some(result) = f().await {
+            return Some(result);
+        }
+    }
+    None
 }
 
 /// Lazy-fetch channel metadata for a channel not in the startup discovery cache.
 ///
 /// Handles channels added dynamically via membership notifications after startup.
-/// Uses `CONTEXT_FETCH_TIMEOUT` with one retry on failure. Returns `None` on
+/// Uses `crate::settings::get().pool.context_fetch_timeout_ms` with one retry on failure. Returns `None` on
 /// persistent failure (graceful degradation — prompt will lack channel name and
 /// DM detection).
 pub(crate) async fn fetch_channel_info(
@@ -3677,7 +3743,7 @@ async fn fetch_channel_info_once(channel_id: Uuid, rest: &RestClient) -> Option<
         .custom_tags(d_tag, [channel_id.to_string()]);
 
     match timeout(
-        CONTEXT_FETCH_TIMEOUT,
+        crate::settings::get().pool.context_fetch_timeout_ms,
         rest.query(std::slice::from_ref(&filter)),
     )
     .await
@@ -3703,7 +3769,9 @@ async fn fetch_channel_info_once(channel_id: Uuid, rest: &RestClient) -> Option<
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             Some(PromptChannelInfo {
-                name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
+                name: name
+                    .unwrap_or(crate::settings::get().pool.unknown_channel_name.as_str())
+                    .to_string(),
                 channel_type,
                 description,
                 project: None,
@@ -3740,7 +3808,12 @@ pub(crate) async fn fetch_project_home_for_channel(
     let mut events = Vec::new();
     for filter in filters {
         let mut page_events = fetch_with_retry(|| async {
-            match timeout(CONTEXT_FETCH_TIMEOUT, rest.query_raw_all(filter.clone())).await {
+            match timeout(
+                crate::settings::get().pool.context_fetch_timeout_ms,
+                rest.query_raw_all(filter.clone()),
+            )
+            .await
+            {
                 Ok(Ok(events)) => Some(events),
                 Ok(Err(e)) => {
                     tracing::debug!(
@@ -3794,7 +3867,7 @@ async fn fetch_huddle_instructions(
         .custom_tags(h_tag, [channel_id.to_string()])
         .limit(1);
     let json = match timeout(
-        CONTEXT_FETCH_TIMEOUT,
+        crate::settings::get().pool.context_fetch_timeout_ms,
         rest.query(std::slice::from_ref(&filter)),
     )
     .await
@@ -3856,9 +3929,8 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         .custom_tags(h_tag, [channel_id.to_string()])
         .limit(1);
 
-    const CANVAS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     let json = match tokio::time::timeout(
-        CANVAS_FETCH_TIMEOUT,
+        crate::settings::get().pool.canvas_fetch_timeout_secs,
         rest.query(std::slice::from_ref(&filter)),
     )
     .await
@@ -3876,7 +3948,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
             tracing::warn!(
                 target: "canvas::fetch",
                 channel = %channel_id,
-                timeout_ms = CANVAS_FETCH_TIMEOUT.as_millis() as u64,
+                timeout_ms = crate::settings::get().pool.canvas_fetch_timeout_secs.as_millis() as u64,
                 "canvas fetch timed out — emitting no section"
             );
             return None;
@@ -4329,7 +4401,7 @@ async fn fetch_prompt_profile_lookup(
 
     fetch_with_retry(|| async {
         match timeout(
-            CONTEXT_FETCH_TIMEOUT,
+            crate::settings::get().pool.context_fetch_timeout_ms,
             rest.query(std::slice::from_ref(&filter)),
         )
         .await
@@ -4441,7 +4513,12 @@ where
     let context = fetch_with_retry(|| async {
         let mut filters = vec![root_filter.clone(), replies_filter.clone()];
         filters.push(agent_reply_filter.clone());
-        match timeout(CONTEXT_FETCH_TIMEOUT, query(filters)).await {
+        match timeout(
+            crate::settings::get().pool.context_fetch_timeout_ms,
+            query(filters),
+        )
+        .await
+        {
             Ok(Ok(json)) => parse_nostr_thread_response_with_meta(
                 json,
                 root_event_id,
@@ -4512,24 +4589,28 @@ where
     Count: Fn(Vec<nostr::Filter>) -> CountFut,
     CountFut: std::future::Future<Output = Result<serde_json::Value, crate::relay::RelayError>>,
 {
-    let replies_count =
-        match timeout(CONTEXT_COUNT_TIMEOUT, count(vec![replies_filter.clone()])).await {
-            Ok(Ok(json)) => json.get("count").and_then(|v| v.as_u64())?,
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    channel_id = %channel_id,
-                    "thread context count failed; using sentinel minimum: {e}"
-                );
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!(
-                    channel_id = %channel_id,
-                    "thread context count timed out; using sentinel minimum"
-                );
-                return None;
-            }
-        };
+    let replies_count = match timeout(
+        crate::settings::get().pool.context_count_timeout_ms,
+        count(vec![replies_filter.clone()]),
+    )
+    .await
+    {
+        Ok(Ok(json)) => json.get("count").and_then(|v| v.as_u64())?,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                channel_id = %channel_id,
+                "thread context count failed; using sentinel minimum: {e}"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(
+                channel_id = %channel_id,
+                "thread context count timed out; using sentinel minimum"
+            );
+            return None;
+        }
+    };
 
     Some(replies_count as usize + usize::from(root_present))
 }
@@ -4568,7 +4649,12 @@ where
         .limit(limit as usize);
 
     fetch_with_retry(|| async {
-        match timeout(CONTEXT_FETCH_TIMEOUT, query(vec![filter.clone()])).await {
+        match timeout(
+            crate::settings::get().pool.context_fetch_timeout_ms,
+            query(vec![filter.clone()]),
+        )
+        .await
+        {
             Ok(Ok(json)) => parse_nostr_dm_response(json, limit),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -4734,7 +4820,7 @@ struct ParsedThreadContext {
 
 fn thread_reply_fetch_limit(limit: u32, overfetch_session_delta: bool) -> u32 {
     if overfetch_session_delta {
-        limit.saturating_mul(2)
+        limit.saturating_mul(crate::settings::get().pool.overfetch_factor)
     } else {
         limit
     }
@@ -4951,7 +5037,7 @@ struct ControlCancelFailure {
 /// own drain-deadline `HardTimeout` into `CancelDrainTimeout` before
 /// returning — but for defense in depth an unexpected `HardTimeout` at this
 /// bounded cancellation boundary must never regain real hard-cap/dead-letter
-/// classification, so it maps to `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`
+/// classification, so it maps to `CancelDrainTimeout(crate::settings::get().pool.control_cancel_grace_secs)`
 /// rather than `Timeout(Hard)`.
 fn classify_control_cancel_failure(
     ctx: &PromptContext,
@@ -4969,7 +5055,9 @@ fn classify_control_cancel_failure(
         // report the truthful non-hard outcome rather than the real hard-cap
         // (which would dead-letter the batch and claim the configured cap).
         AcpError::HardTimeout { .. } => (
-            PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+            PromptOutcome::CancelDrainTimeout(
+                crate::settings::get().pool.control_cancel_grace_secs,
+            ),
             false,
         ),
         other => (PromptOutcome::Error(other), false),
@@ -5420,8 +5508,12 @@ async fn publish_agent_turn_metric(
             return;
         }
     };
-    const METRIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-    match tokio::time::timeout(METRIC_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
+    match tokio::time::timeout(
+        crate::settings::get().pool.metric_timeout_secs,
+        ctx.rest_client.submit_event(&event),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
             target: "pool::metrics",
@@ -5437,12 +5529,6 @@ async fn publish_agent_turn_metric(
         ),
     }
 }
-
-const REACTION_SEEN: &str = "👀";
-const REACTION_WORKING: &str = "💬";
-
-/// Best-effort timeout for a single reaction REST call.
-const REACTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Percent-encode a string for use in a URL path segment (used in tests only).
 #[cfg(test)]
@@ -5489,7 +5575,12 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
             return;
         }
     };
-    match tokio::time::timeout(REACTION_TIMEOUT, rest.submit_event(&event)).await {
+    match tokio::time::timeout(
+        crate::settings::get().pool.reaction_timeout_ms,
+        rest.submit_event(&event),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::debug!(event_id, emoji, "reaction add failed: {e}"),
         Err(_) => tracing::debug!(event_id, emoji, "reaction add timed out"),
@@ -5510,7 +5601,14 @@ pub(crate) async fn post_failure_notice(
     else {
         return;
     };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+    match tokio::time::timeout(
+        crate::settings::get()
+            .pool
+            .failure_notice_submit_timeout_secs,
+        rest.submit_event(&event),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
         Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
@@ -5576,7 +5674,11 @@ pub(crate) async fn reaction_remove(rest: &crate::relay::RestClient, event_id: &
         .author(my_pubkey)
         .custom_tags(e_tag, [event_id]);
 
-    let resp = match tokio::time::timeout(Duration::from_millis(1_000), rest.query(&[filter])).await
+    let resp = match tokio::time::timeout(
+        crate::settings::get().pool.reaction_remove_query_timeout_ms,
+        rest.query(&[filter]),
+    )
+    .await
     {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
@@ -5634,41 +5736,44 @@ pub(crate) async fn reaction_remove(rest: &crate::relay::RestClient, event_id: &
             return;
         }
     };
-    match tokio::time::timeout(Duration::from_millis(1_000), rest.submit_event(&event)).await {
+    match tokio::time::timeout(
+        crate::settings::get()
+            .pool
+            .reaction_remove_submit_timeout_ms,
+        rest.submit_event(&event),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::debug!(event_id, emoji, "reaction remove failed: {e}"),
         Err(_) => tracing::debug!(event_id, emoji, "reaction remove timed out"),
     }
 }
 
-/// Maximum concurrent reaction HTTP requests per fan-out call.
-/// Prevents unbounded parallelism when a large batch of events arrives.
-const REACTION_CONCURRENCY: usize = 10;
-
-/// Add 💬 to all events, capped at `REACTION_CONCURRENCY` concurrent requests.
+/// Add 💬 to all events, capped at `pool.reaction_concurrency` concurrent requests.
 /// Awaited inline before the prompt fires.
 async fn react_working(rest: &crate::relay::RestClient, event_ids: &[String]) {
-    for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
+    for chunk in event_ids.chunks(crate::settings::get().pool.reaction_concurrency) {
         futures_util::future::join_all(
             chunk
                 .iter()
-                .map(|eid| reaction_add(rest, eid, REACTION_WORKING)),
+                .map(|eid| reaction_add(rest, eid, &crate::settings::get().pool.reaction_working)),
         )
         .await;
     }
 }
 
 /// Fire-and-forget: remove both 👀 and 💬 from all events. Spawned on turn complete.
-/// Capped at `REACTION_CONCURRENCY` concurrent requests per chunk to avoid
+/// Capped at `crate::settings::get().pool.reaction_concurrency` concurrent requests per chunk to avoid
 /// unbounded HTTP fan-out on large batches.
 async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>) {
     // Each event needs two removals (👀 and 💬); pair them and chunk by
-    // REACTION_CONCURRENCY pairs so the total concurrent requests stay bounded.
-    for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
+    // crate::settings::get().pool.reaction_concurrency pairs so the total concurrent requests stay bounded.
+    for chunk in event_ids.chunks(crate::settings::get().pool.reaction_concurrency) {
         futures_util::future::join_all(chunk.iter().flat_map(|eid| {
             [
-                reaction_remove(&rest, eid, REACTION_SEEN),
-                reaction_remove(&rest, eid, REACTION_WORKING),
+                reaction_remove(&rest, eid, &crate::settings::get().pool.reaction_seen),
+                reaction_remove(&rest, eid, &crate::settings::get().pool.reaction_working),
             ]
         }))
         .await;
@@ -5698,6 +5803,7 @@ pub(crate) mod tests {
 
     #[test]
     fn delivery_receipt_line_sorts_event_ids() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::nil();
         let event_ids = HashSet::from(["beta".to_string(), "alpha".to_string()]);
 
@@ -5712,6 +5818,7 @@ pub(crate) mod tests {
     // the harness falls back to per-tool auto-approval. Pin both edges directly.
     #[test]
     fn agent_supports_mode_advertised_auto_is_true() {
+        crate::settings::init_for_tests();
         let session_new = json!({
             "modes": { "availableModes": [{ "id": "default" }, { "id": "auto" }] }
         });
@@ -5723,6 +5830,7 @@ pub(crate) mod tests {
 
     #[test]
     fn agent_supports_mode_absent_auto_is_false() {
+        crate::settings::init_for_tests();
         let session_new = json!({
             "modes": { "availableModes": [{ "id": "default" }] }
         });
@@ -5734,6 +5842,7 @@ pub(crate) mod tests {
 
     #[test]
     fn agent_supports_mode_missing_modes_field_is_false() {
+        crate::settings::init_for_tests();
         let session_new = json!({ "sessionId": "sess-1" });
         assert!(!agent_supports_mode(
             &session_new,
@@ -5743,6 +5852,7 @@ pub(crate) mod tests {
 
     #[test]
     fn public_session_forwards_channel_origin_to_mcp() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let servers = mcp_servers_with_git_origin(
             &[test_mcp_server()],
@@ -5761,6 +5871,7 @@ pub(crate) mod tests {
 
     #[test]
     fn private_session_forwards_agent_name_without_channel_id() {
+        crate::settings::init_for_tests();
         let servers = mcp_servers_with_git_origin(
             &[test_mcp_server()],
             Some(Uuid::new_v4()),
@@ -5789,6 +5900,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_legacy_agent_gets_base_prepended() {
+        crate::settings::init_for_tests();
         // protocol_version 1 + Some(base_prompt): <base> rides along in the
         // user message.
         let composed = prepend_standing_for_legacy(
@@ -5804,6 +5916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_modern_agent_omits_base() {
+        crate::settings::init_for_tests();
         // protocol_version 2 receives base_prompt via session/new, so the user
         // message is left untouched even when a base_prompt is present.
         let composed = prepend_standing_for_legacy(
@@ -5816,6 +5929,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_heartbeat_standing_block_is_base_only() {
+        crate::settings::init_for_tests();
         // A heartbeat has no channel, so core and canvas are absent by
         // construction — and it has never carried the persona. Pin that the
         // shared helper does not start handing heartbeats [Agent Instructions].
@@ -5827,6 +5941,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_legacy_agent_without_base_is_unchanged() {
+        crate::settings::init_for_tests();
         // No base_prompt configured: nothing to prepend regardless of version.
         let composed = prepend_standing_for_legacy(1, &base_only(None), "hello channel");
         assert_eq!(composed, "hello channel");
@@ -5847,6 +5962,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_legacy_agent_gets_whole_standing_block() {
+        crate::settings::init_for_tests();
         // The initial message is the legacy agent's first contact, so it must
         // carry every standing section — not just <base> and the canvas, which
         // left the agent acting on its first turn with no persona and no memory.
@@ -5875,6 +5991,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_standing_order_matches_per_turn_order() {
+        crate::settings::init_for_tests();
         // Both legacy paths render through StandingContext, so the initial
         // message and a first-turn prompt agree section-for-section.
         let standing = full_standing();
@@ -5887,6 +6004,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_modern_agent_omits_standing_block() {
+        crate::settings::init_for_tests();
         // Protocol-v2 agents hold all of this from session/new; repeating it in
         // the initial-message user turn would double-render every section.
         let composed = prepend_standing_for_legacy(2, &full_standing(), "do the thing");
@@ -5895,6 +6013,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_initial_message_legacy_agent_without_standing_is_unchanged() {
+        crate::settings::init_for_tests();
         // Nothing configured: body passes through with no stray blank lines.
         let composed =
             prepend_standing_for_legacy(1, &crate::queue::StandingContext::default(), "do it");
@@ -5906,6 +6025,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_both_present_carries_both_headers() {
+        crate::settings::init_for_tests();
         // Also the regression guard against #2372: the session title travels
         // out of band in `_meta.sessionTitle`, so this exact-bytes assertion is
         // what pins the framing against a `[Session]` section reappearing here.
@@ -5919,6 +6039,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_base_only_labels_base() {
+        crate::settings::init_for_tests();
         let framed =
             framed_system_prompt("/workspace", Some("base text"), None).expect("base yields Some");
         assert_eq!(
@@ -5929,6 +6050,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_persona_only_labels_agent_instructions() {
+        crate::settings::init_for_tests();
         // A bare persona would be mislabeled "Base" downstream — it must carry
         // its own <agent-instructions> boundary even when no base prompt exists.
         let framed = framed_system_prompt("/workspace", None, Some("persona text"))
@@ -5941,6 +6063,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_preserves_persona_bytes_verbatim() {
+        crate::settings::init_for_tests();
         let persona = "literal </agent-instructions>, <T>, &quot;, & <policy>";
         let framed =
             framed_system_prompt("/workspace", None, Some(persona)).expect("persona yields Some");
@@ -5952,11 +6075,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_framed_system_prompt_neither_is_none() {
+        crate::settings::init_for_tests();
         assert!(framed_system_prompt("/workspace", None, None).is_none());
     }
 
     #[test]
     fn test_workspace_section_preserves_windows_cwd() {
+        crate::settings::init_for_tests();
         assert_eq!(
             workspace_section(r"C:\Users\me\buzz"),
             "<workspace>\nCurrent working directory: C:\\Users\\me\\buzz\n</workspace>"
@@ -5965,6 +6090,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_with_core_appends_below_framed() {
+        crate::settings::init_for_tests();
         let framed = with_core(
             Some("[Agent Instructions]\npersona".to_string()),
             Some("[Agent Memory — core]\nbe helpful"),
@@ -5978,6 +6104,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_with_core_framed_only_passes_through() {
+        crate::settings::init_for_tests();
         let framed = with_core(Some("[Agent Instructions]\npersona".to_string()), None)
             .expect("framed-only yields Some");
         assert_eq!(framed, "[Agent Instructions]\npersona");
@@ -5985,6 +6112,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_with_core_core_only_is_just_core() {
+        crate::settings::init_for_tests();
         let framed = with_core(None, Some("[Agent Memory — core]\nbe helpful"))
             .expect("core-only yields Some");
         assert_eq!(framed, "<core-memory>\nbe helpful\n</core-memory>");
@@ -5992,11 +6120,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_with_core_neither_is_none() {
+        crate::settings::init_for_tests();
         assert!(with_core(None, None).is_none());
     }
 
     #[test]
     fn test_parse_thread_response_basic() {
+        crate::settings::init_for_tests();
         let json = json!({
             "root": {
                 "event_id": "abc123",
@@ -6036,6 +6166,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_thread_response_truncated() {
+        crate::settings::init_for_tests();
         let json = json!({
             "root": {
                 "event_id": "abc",
@@ -6073,6 +6204,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_thread_response_empty() {
+        crate::settings::init_for_tests();
         let json = json!({
             "root": null,
             "replies": [],
@@ -6083,6 +6215,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_thread_response_missing_fields() {
+        crate::settings::init_for_tests();
         // Malformed JSON — no root, no replies key.
         let json = json!({ "something": "else" });
         assert!(parse_thread_response(json).is_none());
@@ -6090,6 +6223,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_dm_response_basic() {
+        crate::settings::init_for_tests();
         let json = json!({
             "messages": [
                 {
@@ -6129,6 +6263,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_dm_response_truncated() {
+        crate::settings::init_for_tests();
         let json = json!({
             "messages": [
                 {
@@ -6156,6 +6291,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_dm_response_not_truncated_despite_cursor() {
+        crate::settings::init_for_tests();
         // Relay always sets next_cursor when page is non-empty, but if
         // returned count < limit, the page is complete.
         let json = json!({
@@ -6185,6 +6321,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_dm_response_empty() {
+        crate::settings::init_for_tests();
         let json = json!({
             "messages": [],
             "next_cursor": null
@@ -6194,12 +6331,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_dm_response_missing_messages_key() {
+        crate::settings::init_for_tests();
         let json = json!({ "data": [] });
         assert!(parse_dm_response(json, 12).is_none());
     }
 
     #[test]
     fn test_parse_nostr_thread_response_marks_query_window_truncated() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let agent_hex = agent.public_key().to_hex();
@@ -6256,6 +6395,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_nostr_thread_response_not_truncated_below_limit() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let json = json!([
@@ -6293,6 +6433,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_nostr_thread_response_marks_missing_root_incomplete() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let json = json!([
@@ -6330,6 +6471,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_nostr_thread_response_keeps_agent_reply_outside_recent_window() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let agent_hex = agent.public_key().to_hex();
@@ -6391,6 +6533,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_uses_exact_count_when_above_sentinel_minimum() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let channel_id = Uuid::new_v4();
@@ -6455,6 +6598,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_does_not_add_missing_root_to_exact_count() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let channel_id = Uuid::new_v4();
@@ -6512,6 +6656,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_clamps_count_below_sentinel_minimum() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let channel_id = Uuid::new_v4();
@@ -6569,6 +6714,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_preserves_sentinel_minimum_when_count_fails() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
         let channel_id = Uuid::new_v4();
@@ -6626,6 +6772,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_deduplicates_and_pins_agent_reply() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let agent_hex = agent.public_key().to_hex();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -6706,6 +6853,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn hydrated_thread_retains_same_key_reply_from_another_session() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let agent_hex = agent.public_key().to_hex();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -6801,6 +6949,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_fetch_thread_context_uses_distinct_fetched_replies_as_minimum() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let agent_hex = agent.public_key().to_hex();
         let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -6933,6 +7082,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_json_to_context_message_integer_timestamp() {
+        crate::settings::init_for_tests();
         let obj = json!({
             "pubkey": "abc",
             "content": "hello",
@@ -6946,6 +7096,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_json_to_context_message_string_timestamp() {
+        crate::settings::init_for_tests();
         let obj = json!({
             "pubkey": "abc",
             "content": "hello",
@@ -6957,12 +7108,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_json_to_context_message_missing_content() {
+        crate::settings::init_for_tests();
         let obj = json!({ "pubkey": "abc" });
         assert!(json_to_context_message(&obj).is_none());
     }
 
     #[test]
     fn test_collect_prompt_pubkeys_includes_authors_mentions_and_context() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let p_tag = Tag::parse([
             "p",
@@ -6982,6 +7135,7 @@ pub(crate) mod tests {
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -7013,6 +7167,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_kind0_profile_lookup_extracts_display_name_and_nip05() {
+        crate::settings::init_for_tests();
         let lookup = parse_kind0_profile_lookup(json!([
             {
                 "id": "0000000000000000000000000000000000000000000000000000000000000001",
@@ -7038,6 +7193,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_profile_event_is_agent_detects_nip_oa_auth_tag() {
+        crate::settings::init_for_tests();
         // Agent profile carries a 4-element NIP-OA ["auth", owner, cond, sig] tag.
         let agent_ev = json!({
             "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -7060,6 +7216,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_kind0_profile_lookup_returns_none_for_empty() {
+        crate::settings::init_for_tests();
         assert!(parse_kind0_profile_lookup(json!([])).is_none());
         assert!(parse_kind0_profile_lookup(json!({})).is_none());
     }
@@ -7075,6 +7232,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn run_prompt_task_observes_thread_root_only_for_thread_scope() {
+        crate::settings::init_for_tests();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -7194,6 +7352,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn run_prompt_task_commits_standing_context_only_after_acp_success() {
+        crate::settings::init_for_tests();
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-standing-lifecycle-{}.ndjson",
             Uuid::new_v4()
@@ -7294,6 +7453,7 @@ done"#
 
     #[tokio::test]
     async fn channel_prompt_commits_delivery_state_only_after_acp_success() {
+        crate::settings::init_for_tests();
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-channel-delivery-lifecycle-{}.ndjson",
             Uuid::new_v4()
@@ -7355,6 +7515,7 @@ done"#
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
+                    issue: None,
                     received_at: std::time::Instant::now(),
                 }],
                 cancelled_events: vec![],
@@ -7422,6 +7583,7 @@ done"#
 
     #[tokio::test]
     async fn hydrated_thread_prompt_omits_agent_reply_but_keeps_new_human_context() {
+        crate::settings::init_for_tests();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -7556,6 +7718,7 @@ done"#
                 edit: None,
                 event: root,
                 prompt_tag: "@mention".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -7568,6 +7731,7 @@ done"#
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -7639,6 +7803,7 @@ done"#
 
     #[tokio::test]
     async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
+        crate::settings::init_for_tests();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -7661,12 +7826,14 @@ done"#
                 edit: None,
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
                 edit: None,
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancel_reason: Some(crate::queue::CancelReason::Steer),
@@ -7678,6 +7845,7 @@ done"#
                 edit: None,
                 event: next_event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -7818,6 +7986,7 @@ done"#
 
     #[tokio::test]
     async fn late_successful_steer_ack_excludes_event_from_next_channel_wire_prompt() {
+        crate::settings::init_for_tests();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -7836,6 +8005,7 @@ done"#
                 edit: None,
                 event: trigger,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -7967,6 +8137,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn delivery_state_commits_only_when_explicitly_marked_successful() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let mut state = SessionState::default();
         state
@@ -7996,22 +8167,36 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn delivery_state_bounds_hydrated_thread_roots() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let mut state = SessionState::default();
-        let roots = (0..=MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE)
+        let roots = (0..=crate::settings::get()
+            .pool
+            .max_hydrated_thread_roots_per_scope)
             .map(|index| format!("root-{index}"))
             .collect::<Vec<_>>();
 
         state.mark_scope_delivery_success(conv(channel), false, [], roots);
 
         let hydrated = &state.deliveries[&conv(channel)].hydrated_thread_roots;
-        assert_eq!(hydrated.len(), MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE);
+        assert_eq!(
+            hydrated.len(),
+            crate::settings::get()
+                .pool
+                .max_hydrated_thread_roots_per_scope
+        );
         assert!(!hydrated.contains(&"root-0".to_string()));
-        assert!(hydrated.contains(&format!("root-{MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE}")));
+        assert!(hydrated.contains(&format!(
+            "root-{}",
+            crate::settings::get()
+                .pool
+                .max_hydrated_thread_roots_per_scope
+        )));
     }
 
     #[test]
     fn delivery_state_is_cleared_on_rotation_and_restarts_empty() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let mut state = SessionState::default();
         state.sessions.insert(conv(channel), "old-session".into());
@@ -8037,6 +8222,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn conversation_context_delta_omits_delivered_and_triggering_events() {
+        crate::settings::init_for_tests();
         let delivered = HashSet::from(["old".to_string()]);
         let triggering = HashSet::from(["trigger".to_string()]);
         let context = ConversationContext::Thread {
@@ -8071,6 +8257,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn fresh_thread_trigger_dedup_preserves_complete_context_hint() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let agent = Keys::generate();
         let human = Keys::generate();
@@ -8120,6 +8307,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -8142,6 +8330,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn fresh_dm_trigger_dedup_preserves_complete_context_hint() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let human = Keys::generate();
         let h_tag = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
@@ -8174,6 +8363,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -8204,6 +8394,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn conversation_context_delta_returns_none_when_no_new_events_remain() {
+        crate::settings::init_for_tests();
         let delivered = HashSet::from(["old".to_string()]);
         let context = ConversationContext::Dm {
             messages: vec![context_message("old", "already sent")],
@@ -8216,6 +8407,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn conversation_context_delta_preserves_unidentified_legacy_messages() {
+        crate::settings::init_for_tests();
         let context = ConversationContext::Dm {
             messages: vec![context_message("", "cannot safely deduplicate")],
             total: 1,
@@ -8229,6 +8421,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn conversation_context_delta_preserves_same_author_message_not_delivered_to_session() {
+        crate::settings::init_for_tests();
         let agent = Keys::generate();
         let human = Keys::generate();
         let context = ConversationContext::Thread {
@@ -8286,6 +8479,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_json_to_context_message_missing_pubkey_uses_default() {
+        crate::settings::init_for_tests();
         let obj = json!({ "content": "hello" });
         let msg = json_to_context_message(&obj).expect("should parse");
         assert_eq!(msg.pubkey, "unknown");
@@ -8293,34 +8487,40 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_pct_encode_hex_passthrough() {
+        crate::settings::init_for_tests();
         let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         assert_eq!(pct_encode(hex), hex);
     }
 
     #[test]
     fn test_pct_encode_emoji() {
+        crate::settings::init_for_tests();
         // 👀 = U+1F440 = F0 9F 91 80 in UTF-8
         assert_eq!(pct_encode("👀"), "%F0%9F%91%80");
     }
 
     #[test]
     fn test_pct_encode_emoji_speech_balloon() {
+        crate::settings::init_for_tests();
         // 💬 = U+1F4AC = F0 9F 92 AC in UTF-8
         assert_eq!(pct_encode("💬"), "%F0%9F%92%AC");
     }
 
     #[test]
     fn test_pct_encode_empty() {
+        crate::settings::init_for_tests();
         assert_eq!(pct_encode(""), "");
     }
 
     #[test]
     fn test_pct_encode_unreserved_passthrough() {
+        crate::settings::init_for_tests();
         assert_eq!(pct_encode("AZaz09-_.~"), "AZaz09-_.~");
     }
 
     #[test]
     fn test_pct_encode_reserved_chars() {
+        crate::settings::init_for_tests();
         assert_eq!(pct_encode("/"), "%2F");
         assert_eq!(pct_encode("+"), "%2B");
         assert_eq!(pct_encode(" "), "%20");
@@ -8367,6 +8567,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn two_threads_in_one_channel_get_distinct_sessions() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let ta = thread_scope(ch, &"a".repeat(64));
         let tb = thread_scope(ch, &"b".repeat(64));
@@ -8393,6 +8594,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn invalidate_scope_leaves_sibling_thread_untouched() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let ta = thread_scope(ch, &"a".repeat(64));
         let tb = thread_scope(ch, &"b".repeat(64));
@@ -8415,6 +8617,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -8433,6 +8636,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn context_target_uses_thread_scope_root_not_last_event_tags() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let scope_root = "a".repeat(64);
         // Last event carries a DIFFERENT root tag than the scope; the scope
@@ -8452,6 +8656,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn context_target_new_top_level_thread_has_no_history() {
+        crate::settings::init_for_tests();
         // A top-level mention opens a thread rooted at its own id; on the first
         // turn there is no prior thread history to fetch, but the scope still
         // resolves to that root (subsequent turns fetch it).
@@ -8467,6 +8672,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn context_target_conversation_channel_plain_has_none() {
+        crate::settings::init_for_tests();
         // Channel-policy conversation scope + a plain (no-thread-tag) event =>
         // no unrelated channel transcript is injected.
         let ch = Uuid::new_v4();
@@ -8477,6 +8683,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn merged_batch_hydrates_only_successfully_fetched_non_dm_target() {
+        crate::settings::init_for_tests();
         let channel = Uuid::new_v4();
         let cancelled_root = "a".repeat(64);
         let fetched_root = "b".repeat(64);
@@ -8498,6 +8705,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             edit: None,
             event: cancelled,
             prompt_tag: "cancelled".into(),
+            issue: None,
             received_at: std::time::Instant::now(),
         });
         let target = resolve_context_target(&batch, false);
@@ -8526,6 +8734,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn context_target_dm_nonreply_is_dm_history() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let ev = signed_event_with_tags(vec![]);
         let batch = batch_with_scope(conv(ch), ev);
@@ -8534,6 +8743,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn context_target_conversation_reply_uses_reply_chain() {
+        crate::settings::init_for_tests();
         // DM (or legacy channel-policy) reply: conversation scope but the last
         // event has thread tags => fetch that reply chain.
         let ch = Uuid::new_v4();
@@ -8551,6 +8761,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn invalidate_channel_clears_every_thread_scope() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let other = Uuid::new_v4();
         let mut s = SessionState::default();
@@ -8568,6 +8779,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn prompt_source_scope_exposes_thread_scope_and_none_for_heartbeat() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let scope = thread_scope(ch, &"a".repeat(64));
         let channel = PromptSource::Channel(scope.clone());
@@ -8580,6 +8792,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn invalidate_scope_session_targets_one_thread_and_drops_its_owner() {
+        crate::settings::init_for_tests();
         // The idle `!rotate` path: rotating thread A must invalidate only thread
         // A's session and drop its scope-owner entry, leaving a sibling thread
         // in the same channel fully intact.
@@ -8696,6 +8909,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     // cross-channel head-of-line-blocking regression guard (PR #6732).
     #[tokio::test]
     async fn hold_decision_covers_variant_session_busy_and_timeout() {
+        crate::settings::init_for_tests();
         #[derive(Debug)]
         enum Expect {
             Dispatch,
@@ -8830,6 +9044,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn held_scope_deadline_wakes_a_quiet_dispatch_loop() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let scope = thread_scope(channel_id, &"a".repeat(64));
         let idle_scope = thread_scope(channel_id, &"c".repeat(64));
@@ -8840,16 +9055,23 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
         let started = tokio::time::Instant::now();
         assert!(matches!(
-            pool.hold_decision(&scope, started, HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(
+                &scope,
+                started,
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
+            ),
             HoldDecision::Hold { .. }
         ));
         let deadline = pool
-            .next_hold_deadline(HOLD_BUSY_OWNER_TIMEOUT)
+            .next_hold_deadline(crate::settings::get().pool.hold_busy_owner_timeout_secs)
             .expect("held scope schedules an independent wake");
         let wake = AgentPool::wait_for_hold_deadline(Some(deadline));
         tokio::pin!(wake);
 
-        tokio::time::advance(HOLD_BUSY_OWNER_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::time::advance(
+            crate::settings::get().pool.hold_busy_owner_timeout_secs - Duration::from_millis(1),
+        )
+        .await;
         assert!(
             tokio::time::timeout(Duration::ZERO, &mut wake)
                 .await
@@ -8860,13 +9082,18 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         wake.await;
 
         assert!(matches!(
-            pool.hold_decision(&scope, tokio::time::Instant::now(), HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(
+                &scope,
+                tokio::time::Instant::now(),
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
+            ),
             HoldDecision::ForkAfterHold { .. }
         ));
     }
 
     #[tokio::test]
     async fn expired_hold_survives_pool_exhaustion_until_a_worker_is_claimable() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let scope = thread_scope(channel_id, &"a".repeat(64));
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -8875,14 +9102,18 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
         let started = tokio::time::Instant::now();
         assert!(matches!(
-            pool.hold_decision(&scope, started, HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(
+                &scope,
+                started,
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
+            ),
             HoldDecision::Hold { .. }
         ));
         assert!(matches!(
             pool.hold_decision(
                 &scope,
-                started + HOLD_BUSY_OWNER_TIMEOUT,
-                HOLD_BUSY_OWNER_TIMEOUT
+                started + crate::settings::get().pool.hold_busy_owner_timeout_secs,
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
             ),
             HoldDecision::ForkAfterHold { .. }
         ));
@@ -8891,7 +9122,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "failed claim must not restart the timeout"
         );
         assert_eq!(
-            pool.next_hold_deadline(HOLD_BUSY_OWNER_TIMEOUT),
+            pool.next_hold_deadline(crate::settings::get().pool.hold_busy_owner_timeout_secs),
             None,
             "an expired hold cannot spin while all workers are checked out"
         );
@@ -8899,15 +9130,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let idle_scope = thread_scope(channel_id, &"c".repeat(64));
         pool.agents[0] = Some(idle_agent_with_session(0, idle_scope).await);
         assert_eq!(
-            pool.next_hold_deadline(HOLD_BUSY_OWNER_TIMEOUT),
-            Some(started + HOLD_BUSY_OWNER_TIMEOUT),
+            pool.next_hold_deadline(crate::settings::get().pool.hold_busy_owner_timeout_secs),
+            Some(started + crate::settings::get().pool.hold_busy_owner_timeout_secs),
             "worker availability immediately re-arms the expired deadline"
         );
         assert!(matches!(
             pool.hold_decision(
                 &scope,
-                started + HOLD_BUSY_OWNER_TIMEOUT + Duration::from_secs(1),
-                HOLD_BUSY_OWNER_TIMEOUT
+                started
+                    + crate::settings::get().pool.hold_busy_owner_timeout_secs
+                    + Duration::from_secs(1),
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
             ),
             HoldDecision::ForkAfterHold { .. }
         ));
@@ -8917,6 +9150,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn forked_scope_discards_stale_session_when_busy_owner_returns() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let scope = thread_scope(channel_id, &"a".repeat(64));
         let busy_scope = thread_scope(channel_id, &"b".repeat(64));
@@ -8933,14 +9167,18 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
         let started = tokio::time::Instant::now();
         assert!(matches!(
-            pool.hold_decision(&scope, started, HOLD_BUSY_OWNER_TIMEOUT),
+            pool.hold_decision(
+                &scope,
+                started,
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
+            ),
             HoldDecision::Hold { .. }
         ));
         assert!(matches!(
             pool.hold_decision(
                 &scope,
-                started + HOLD_BUSY_OWNER_TIMEOUT,
-                HOLD_BUSY_OWNER_TIMEOUT
+                started + crate::settings::get().pool.hold_busy_owner_timeout_secs,
+                crate::settings::get().pool.hold_busy_owner_timeout_secs
             ),
             HoldDecision::ForkAfterHold { .. }
         ));
@@ -8982,7 +9220,27 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     }
 
     #[test]
+    fn limit_stops_still_engage_the_issue_stop_guard() {
+        assert!(stop_engages_goal_guard(&StopReason::EndTurn));
+        assert!(stop_engages_goal_guard(&StopReason::MaxTokens));
+        assert!(stop_engages_goal_guard(&StopReason::MaxTurnRequests));
+        assert!(!stop_engages_goal_guard(&StopReason::Cancelled));
+        assert!(!stop_engages_goal_guard(&StopReason::Refusal));
+    }
+
+    #[test]
+    fn completed_before_control_stop_still_runs_goal_completion() {
+        let reason = completed_before_control_stop();
+        assert_eq!(reason, StopReason::EndTurn);
+        assert!(
+            stop_engages_goal_guard(&reason),
+            "a finished turn that loses the select race must still reach answer delivery and the stop guard"
+        );
+    }
+
+    #[test]
     fn test_rotate_after_natural_completion_invalidates_channel_state() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
 
         apply_completed_before_control_signal(
@@ -9004,6 +9262,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_cancel_after_natural_completion_preserves_channel_state() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
 
         apply_completed_before_control_signal(
@@ -9020,6 +9279,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_channel_clears_session_and_turn_count() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
         s.invalidate(&PromptSource::Channel(SessionScope::Conversation {
             channel_id: ch_a,
@@ -9040,6 +9300,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_heartbeat_clears_session_and_turn_count() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
         s.invalidate(&PromptSource::Heartbeat);
 
@@ -9056,6 +9317,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_all_clears_everything() {
+        crate::settings::init_for_tests();
         let (mut s, _ch_a, _ch_b) = make_state();
         s.invalidate_all();
 
@@ -9069,6 +9331,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_nonexistent_channel_is_noop() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
         let ghost = Uuid::new_v4();
         s.invalidate(&PromptSource::Channel(SessionScope::Conversation {
@@ -9086,6 +9349,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_all_on_empty_state_is_noop() {
+        crate::settings::init_for_tests();
         let mut s = SessionState::default();
         s.invalidate_all(); // should not panic
         assert!(s.sessions.is_empty());
@@ -9095,6 +9359,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_channel_returns_true_when_session_existed() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
         assert!(s.invalidate_channel(&ch_a) > 0);
         assert!(!s.sessions.contains_key(&conv(ch_a)));
@@ -9112,6 +9377,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_channel_returns_false_when_no_session() {
+        crate::settings::init_for_tests();
         let (mut s, _ch_a, _ch_b) = make_state();
         let ghost = Uuid::new_v4();
         assert_eq!(s.invalidate_channel(&ghost), 0);
@@ -9122,6 +9388,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_removed_channels_cleaned_via_invalidate_channel() {
+        crate::settings::init_for_tests();
         // Simulates handle_prompt_result: channels removed while agent
         // was checked out should have both sessions and turn_counts stripped.
         let (mut s, ch_a, ch_b) = make_state();
@@ -9142,6 +9409,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_switch_model_after_natural_completion_invalidates_channel_state() {
+        crate::settings::init_for_tests();
         let (mut s, ch_a, ch_b) = make_state();
 
         // SwitchModel must invalidate just like Rotate so the requeued turn
@@ -9181,6 +9449,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -9190,6 +9459,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
+        crate::settings::init_for_tests();
         let cases = [
             (ControlSignal::Steer, Some(CancelReason::Steer)),
             (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
@@ -9258,6 +9528,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_classify_control_cancel_failure_crosses_error_outcome_and_batch_fate() {
+        crate::settings::init_for_tests();
         let ctx = {
             let mut ctx = make_prompt_context_no_owner();
             ctx.dedup_mode = DedupMode::Queue;
@@ -9277,7 +9548,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let cases = [
             Case {
                 name: "CancelDrainTimeout + Steer preserves batch with Steer reason",
-                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                error: || {
+                    AcpError::CancelDrainTimeout(
+                        crate::settings::get().pool.control_cancel_grace_secs,
+                    )
+                },
                 signal: ControlSignal::Steer,
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: true,
@@ -9286,7 +9561,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
             Case {
                 name: "CancelDrainTimeout + Cancel drops the batch",
-                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                error: || {
+                    AcpError::CancelDrainTimeout(
+                        crate::settings::get().pool.control_cancel_grace_secs,
+                    )
+                },
                 signal: ControlSignal::Cancel,
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: false,
@@ -9295,7 +9574,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
             Case {
                 name: "CancelDrainTimeout + Interrupt preserves batch with Interrupt reason",
-                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                error: || {
+                    AcpError::CancelDrainTimeout(
+                        crate::settings::get().pool.control_cancel_grace_secs,
+                    )
+                },
                 signal: ControlSignal::Interrupt,
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: true,
@@ -9304,7 +9587,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
             Case {
                 name: "CancelDrainTimeout + Rotate drops the batch",
-                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                error: || {
+                    AcpError::CancelDrainTimeout(
+                        crate::settings::get().pool.control_cancel_grace_secs,
+                    )
+                },
                 signal: ControlSignal::Rotate,
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: false,
@@ -9313,7 +9600,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
             Case {
                 name: "CancelDrainTimeout + SwitchModel preserves batch with Interrupt reason",
-                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                error: || {
+                    AcpError::CancelDrainTimeout(
+                        crate::settings::get().pool.control_cancel_grace_secs,
+                    )
+                },
                 signal: ControlSignal::SwitchModel {
                     model_id: "gpt-5".to_string(),
                     request_id: None,
@@ -9425,6 +9716,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_stops_before_completion_frame() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let context =
             observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
@@ -9479,6 +9771,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_fires_until_guard_drops() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let started_at = "2026-07-14T21:00:00Z".to_string();
         let context = observer::context_for_turn(None, None, "t-1".into(), started_at.clone());
@@ -9532,6 +9825,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_backfills_session_id_after_resolution() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let context =
             observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
@@ -9578,6 +9872,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_disabled_when_interval_zero_emits_nothing() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let context = observer::context_for(None, None, Some("t-1".into()));
         let liveness = run_turn_liveness(
@@ -9601,6 +9896,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_without_observer_emits_nothing() {
+        crate::settings::init_for_tests();
         // A turn that never started has no observer handle — the future must
         // park without emitting or panicking.
         let context = observer::context_for(None, None, Some("t-1".into()));
@@ -9635,6 +9931,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test(start_paused = true)]
     async fn test_liveness_emits_nothing_once_closed_flag_is_set() {
+        crate::settings::init_for_tests();
         let observer = observer::ObserverHandle::in_process();
         let context =
             observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
@@ -9665,6 +9962,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_liveness_guard_drop_blocks_while_emit_lock_is_held() {
+        crate::settings::init_for_tests();
         // Standing in for a tick that has already entered its critical
         // section: hold the shared lock before the guard drops.
         let state = Arc::new(Mutex::new(LivenessState {
@@ -9726,6 +10024,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// `install_steer_rx` does not panic.
     #[tokio::test]
     async fn test_send_prompt_result_clears_steer_rx_on_early_return() {
+        crate::settings::init_for_tests();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -9787,6 +10086,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// and the next `install_steer_rx` does not panic.
     #[tokio::test]
     async fn test_send_prompt_result_is_noop_when_steer_rx_already_consumed() {
+        crate::settings::init_for_tests();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -9885,6 +10185,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn send_steer_reports_task_absent_when_no_task_in_flight() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let scope = conv(Uuid::nil());
         let err = pool.send_steer(&scope, steer_request()).unwrap_err();
@@ -9899,6 +10200,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn send_steer_reports_sender_absent_when_no_steer_sender_installed() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let scope = conv(Uuid::nil());
         // The existing seam inserts the in-flight task with steer_tx: None.
@@ -9913,6 +10215,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn send_steer_reports_mailbox_full_when_one_steer_already_in_flight() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let scope = conv(Uuid::nil());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
@@ -9934,6 +10237,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn send_steer_reports_mailbox_closed_after_receiver_dropped() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let scope = conv(Uuid::nil());
         let (tx, rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
@@ -9949,6 +10253,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn send_steer_ok_hands_request_to_read_loop_receiver() {
+        crate::settings::init_for_tests();
         let mut pool = AgentPool::from_slots(vec![]);
         let scope = conv(Uuid::nil());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
@@ -9979,6 +10284,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn steer_admission_reason_labels_round_trip_with_send_steer_refusals() {
+        crate::settings::init_for_tests();
         // send_steer writes exactly these labels via transport_refusal;
         // admission_reason must classify them back without drift.
         for reason in [
@@ -10004,6 +10310,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn steer_admission_reason_excludes_post_admission_errors() {
+        crate::settings::init_for_tests();
         // Ack-native write failures are built in the read loop AFTER
         // admission (acp.rs carries the AcpError display); they and the
         // other ack outcomes must never classify as admission refusals.
@@ -10033,6 +10340,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// variants without panicking on any input.
     #[test]
     fn test_acp_stop_to_core_maps_all_variants() {
+        crate::settings::init_for_tests();
         use buzz_core::agent_turn_metric::StopReason as CoreStop;
         assert_eq!(acp_stop_to_core(&StopReason::EndTurn), CoreStop::EndTurn);
         assert_eq!(
@@ -10053,6 +10361,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// `publish_agent_turn_metric` is a no-op when `usage` is `None`.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_noop_on_no_usage() {
+        crate::settings::init_for_tests();
         let ctx = make_prompt_context_no_owner();
         // usage = None → early return, no panic.
         publish_agent_turn_metric(
@@ -10069,6 +10378,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// `publish_agent_turn_metric` is a no-op when `owner_pubkey` is absent.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_noop_on_no_owner() {
+        crate::settings::init_for_tests();
         let ctx = make_prompt_context_no_owner();
         let usage = crate::usage::TurnUsage {
             session_id: "sess-1".to_string(),
@@ -10106,6 +10416,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// encrypt/sign path executes).
     #[tokio::test]
     async fn test_publish_agent_turn_metric_encrypts_with_owner() {
+        crate::settings::init_for_tests();
         let agent_keys = nostr::Keys::generate();
         let owner_keys = nostr::Keys::generate();
         let ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
@@ -10146,6 +10457,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// returned early without draining usage.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_cancelled_stop_reason() {
+        crate::settings::init_for_tests();
         let agent_keys = nostr::Keys::generate();
         let owner_keys = nostr::Keys::generate();
         let ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
@@ -10185,6 +10497,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// field flows through encrypt/sign without error.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_buzz_agent_harness_name() {
+        crate::settings::init_for_tests();
         let agent_keys = nostr::Keys::generate();
         let owner_keys = nostr::Keys::generate();
         let mut ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
@@ -10226,6 +10539,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// this test; the test constrains the real code path.
     #[test]
     fn test_build_turn_metric_counts_exact_totals_map_through() {
+        crate::settings::init_for_tests();
         let usage = crate::usage::TurnUsage {
             session_id: "sess-total".to_string(),
             turn_seq: 2,
@@ -10278,6 +10592,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// passing but input/output would disagree, making the null-path detectable.
     #[test]
     fn test_build_turn_metric_counts_null_totals_never_derived() {
+        crate::settings::init_for_tests();
         let usage = crate::usage::TurnUsage {
             session_id: "sess-nototal".to_string(),
             turn_seq: 1,
@@ -10341,6 +10656,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// not hardcoded to None.
     #[test]
     fn test_build_turn_metric_counts_cache_read_tokens_thread_through() {
+        crate::settings::init_for_tests();
         // Wire-parse a buzz-agent payload with cache, run it through the tracker,
         // and verify the published TokenCounts carry the cache field.
         let raw1 = serde_json::json!({
@@ -10478,6 +10794,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            goal: None,
+            continuation_tx: None,
         }
     }
 
@@ -10485,6 +10803,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn huddle_instructions_append_as_system_section() {
+        crate::settings::init_for_tests();
         assert_eq!(
             with_huddle_instructions(Some("base".into()), Some("  reply now  ")).as_deref(),
             Some("base\n\n<huddle-instructions>\nreply now\n</huddle-instructions>")
@@ -10493,6 +10812,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn huddle_instructions_require_owner_signature_and_channel() {
+        crate::settings::init_for_tests();
         let owner = Keys::generate();
         let stranger = Keys::generate();
         let channel = Uuid::parse_str("00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae").unwrap();
@@ -10538,6 +10858,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_render_canvas_section_produces_exact_shape() {
+        crate::settings::init_for_tests();
         let id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let ts = "2024-01-15T10:30:00+00:00";
         let uuid = "00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
@@ -10556,6 +10877,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_with_canvas_appends_to_existing_prompt() {
+        crate::settings::init_for_tests();
         let result = with_canvas(Some("base content".into()), Some("[Channel Canvas]\nstuff"));
         assert_eq!(
             result.unwrap(),
@@ -10565,6 +10887,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_with_canvas_returns_canvas_alone_when_no_prompt() {
+        crate::settings::init_for_tests();
         let result = with_canvas(None, Some("[Channel Canvas]\nstuff"));
         assert_eq!(
             result.unwrap(),
@@ -10574,12 +10897,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_with_canvas_returns_prompt_alone_when_no_canvas() {
+        crate::settings::init_for_tests();
         let result = with_canvas(Some("base content".into()), None);
         assert_eq!(result.unwrap(), "base content");
     }
 
     #[test]
     fn test_with_canvas_returns_none_when_both_absent() {
+        crate::settings::init_for_tests();
         let result = with_canvas(None, None);
         assert!(result.is_none());
     }
@@ -10588,6 +10913,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_channel_clears_canvas_section() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let mut s = SessionState::default();
         s.sessions.insert(conv(ch), "sess".into());
@@ -10602,6 +10928,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_all_clears_canvas_sections() {
+        crate::settings::init_for_tests();
         let ch_a = Uuid::new_v4();
         let ch_b = Uuid::new_v4();
         let mut s = SessionState::default();
@@ -10617,6 +10944,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_invalidate_channel_leaves_other_channels_canvas_intact() {
+        crate::settings::init_for_tests();
         let ch_a = Uuid::new_v4();
         let ch_b = Uuid::new_v4();
         let mut s = SessionState::default();
@@ -10633,6 +10961,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_has_channel_state_true_when_only_canvas_section_present() {
+        crate::settings::init_for_tests();
         let ch = Uuid::new_v4();
         let mut s = SessionState::default();
         s.canvas_sections.insert(conv(ch), "canvas".into());
@@ -10659,6 +10988,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_canvas_section_from_query_response_happy_path() {
+        crate::settings::init_for_tests();
         let ev = make_canvas_event_value("# Team instructions\nBe helpful.");
         let id = ev["id"].as_str().unwrap().to_string();
         let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
@@ -10673,12 +11003,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_canvas_section_from_query_response_empty_array_returns_none() {
+        crate::settings::init_for_tests();
         let result = canvas_section_from_query_response(&[], CHANNEL_UUID);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_canvas_section_from_query_response_blank_content_returns_none() {
+        crate::settings::init_for_tests();
         let ev = make_canvas_event_value("   ");
         let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
         assert!(
@@ -10689,6 +11021,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_canvas_section_from_query_response_empty_content_returns_none() {
+        crate::settings::init_for_tests();
         let ev = make_canvas_event_value("");
         let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
         assert!(result.is_none());
@@ -10698,6 +11031,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// must be rejected — not silently accepted with partial metadata.
     #[test]
     fn test_canvas_section_from_query_response_partial_object_returns_none() {
+        crate::settings::init_for_tests();
         let partial = serde_json::json!({
             "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
             "created_at": 1705312200_i64,
@@ -10714,6 +11048,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// must be rejected — the nostr::Event parser enforces integer type.
     #[test]
     fn test_canvas_section_from_query_response_string_timestamp_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
         let mut ev = serde_json::to_value(
@@ -10736,6 +11071,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// must be rejected — nostr::Event requires the field.
     #[test]
     fn test_canvas_section_from_query_response_missing_timestamp_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
         let mut ev = serde_json::to_value(
@@ -10759,6 +11095,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// 1969-12-31T23:59:59Z. The checked i64::try_from must reject it first.
     #[test]
     fn test_canvas_section_from_query_response_timestamp_max_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
         let ev = serde_json::to_value(
@@ -10780,6 +11117,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// must be rejected by event.verify().
     #[test]
     fn test_canvas_section_from_query_response_tampered_event_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
         let mut ev = serde_json::to_value(
@@ -10804,6 +11142,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// An event with the wrong kind (not 40100) must be rejected.
     #[test]
     fn test_canvas_section_from_query_response_wrong_kind_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
         let ev = serde_json::to_value(
@@ -10821,6 +11160,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// must be rejected.
     #[test]
     fn test_canvas_section_from_query_response_wrong_h_tag_returns_none() {
+        crate::settings::init_for_tests();
         let keys = Keys::generate();
         let wrong_h = Tag::parse(["h", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]).expect("h tag");
         let ev = serde_json::to_value(
@@ -10836,6 +11176,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[test]
     fn test_canvas_section_from_query_response_timestamp_uses_z_suffix() {
+        crate::settings::init_for_tests();
         let ev = make_canvas_event_value("instructions");
         let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
         let section = result.expect("valid event must produce a section");
@@ -10906,6 +11247,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn expired_absence_refreshes_to_project_without_restart() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
 
         let id = Uuid::new_v4();
@@ -10954,7 +11296,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         resolver.projects.write().unwrap().insert(
             id,
             CachedProjectInfo {
-                fetched_at: std::time::Instant::now() - PROJECT_INFO_CACHE_TTL,
+                fetched_at: std::time::Instant::now()
+                    - crate::settings::get().pool.project_info_cache_ttl_secs,
                 value: None,
             },
         );
@@ -10971,6 +11314,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn failed_refresh_rejects_expired_absence_but_retains_expired_project() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11012,7 +11356,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         resolver.projects.write().unwrap().insert(
             id,
             CachedProjectInfo {
-                fetched_at: std::time::Instant::now() - PROJECT_INFO_CACHE_TTL,
+                fetched_at: std::time::Instant::now()
+                    - crate::settings::get().pool.project_info_cache_ttl_secs,
                 value: None,
             },
         );
@@ -11043,7 +11388,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         resolver.projects.write().unwrap().insert(
             id,
             CachedProjectInfo {
-                fetched_at: std::time::Instant::now() - PROJECT_INFO_CACHE_TTL,
+                fetched_at: std::time::Instant::now()
+                    - crate::settings::get().pool.project_info_cache_ttl_secs,
                 value: Some(stale_project.clone()),
             },
         );
@@ -11063,6 +11409,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     #[tokio::test]
     async fn indeterminate_project_context_never_reaches_acp_prompt_boundary() {
+        crate::settings::init_for_tests();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -11121,6 +11468,7 @@ done"#
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
+                issue: None,
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -11150,7 +11498,8 @@ done"#
         ctx.channel_info.projects.write().unwrap().insert(
             channel_id,
             CachedProjectInfo {
-                fetched_at: std::time::Instant::now() - PROJECT_INFO_CACHE_TTL,
+                fetched_at: std::time::Instant::now()
+                    - crate::settings::get().pool.project_info_cache_ttl_secs,
                 value: None,
             },
         );
@@ -11187,6 +11536,7 @@ done"#
 
     #[tokio::test]
     async fn resolve_finds_authoritative_project_beyond_first_bridge_page() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11270,6 +11620,7 @@ done"#
     /// project context remains cached independently.
     #[tokio::test]
     async fn test_new_session_channel_context_qualifies_a_normal_channel() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
 
         let id = Uuid::new_v4();
@@ -11302,6 +11653,7 @@ done"#
     /// harness is running reaches the next agent prompt without a restart.
     #[tokio::test]
     async fn test_channel_resolver_refreshes_edited_description() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11377,6 +11729,7 @@ done"#
     /// delivered as the resolved description.
     #[tokio::test]
     async fn test_channel_resolver_delivers_description() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let response = channel_metadata_response(
             id,
@@ -11400,6 +11753,7 @@ done"#
     /// A metadata event with no `about` tag yields no description.
     #[tokio::test]
     async fn test_channel_resolver_absent_description_when_no_about_tag() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
         let (resolver, _requests, server) = counting_resolver(response).await;
@@ -11417,6 +11771,7 @@ done"#
     /// canvas section).
     #[tokio::test]
     async fn test_new_session_channel_context_leaves_a_dm_unqualified() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let response = channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
         let (resolver, _requests, server) = counting_resolver(response).await;
@@ -11438,6 +11793,7 @@ done"#
     /// it would title every unnamed channel `Agent · #unknown`.
     #[tokio::test]
     async fn test_new_session_channel_context_treats_the_unknown_name_as_absent() {
+        crate::settings::init_for_tests();
         let id = Uuid::new_v4();
         let response = channel_metadata_response(id, &[["t", "stream"]]);
         let (resolver, _requests, server) = counting_resolver(response).await;
@@ -11459,6 +11815,7 @@ done"#
     /// exactly when the relay is already degraded.
     #[tokio::test]
     async fn test_new_session_channel_context_attempts_an_unresolved_channel_once() {
+        crate::settings::init_for_tests();
         use std::sync::atomic::Ordering;
 
         let (resolver, requests, server) = counting_resolver(json!([])).await;
@@ -11553,6 +11910,7 @@ done"#
 
     #[tokio::test]
     async fn test_applied_effort_patches_captured_current_value_to_high() {
+        crate::settings::init_for_tests();
         let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
         let mut agent = effort_agent(acp, Some("high"));
         let obs = observer::ObserverHandle::in_process();
@@ -11584,6 +11942,7 @@ done"#
 
     #[tokio::test]
     async fn test_rejected_effort_retains_captured_current_value() {
+        crate::settings::init_for_tests();
         // Adapter answers the effort set with a JSON-RPC error → AgentError →
         // application-level rejection: non-fatal, capture keeps the default.
         let acp = spawn_effort_acp(
@@ -11621,6 +11980,7 @@ done"#
 
     #[tokio::test]
     async fn test_no_thought_level_model_leaves_capture_unpatched() {
+        crate::settings::init_for_tests();
         // Model advertises only a `model` option — no thought_level. The held
         // effort is silently ignored and no set_config_option is sent.
         let opts_no_effort = r#"[{"configId":"model","category":"model","currentValue":"m-a","options":[{"value":"m-a"}]}]"#;
@@ -11655,6 +12015,7 @@ done"#
 
     #[tokio::test]
     async fn test_no_startup_effort_leaves_capture_unpatched() {
+        crate::settings::init_for_tests();
         // No held effort at all: the set_config_option is never sent and the
         // default currentValue survives into the capture.
         let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
@@ -11688,6 +12049,7 @@ done"#
 
     #[tokio::test]
     async fn test_transport_error_on_effort_propagates_for_respawn() {
+        crate::settings::init_for_tests();
         // Adapter exits after answering session/new but before the effort set →
         // AgentExited (transport class) → Err so the caller respawns the worker
         // instead of reusing a possibly-poisoned stream.
@@ -11725,6 +12087,7 @@ exit 0"#
 
     #[test]
     fn test_patch_config_option_current_value_matches_by_id_key() {
+        crate::settings::init_for_tests();
         // The `id` key (claude-agent-acp) must also match, not just `configId`.
         let mut opts = serde_json::json!([
             { "id": "effort", "category": "thought_level", "currentValue": "low" }
@@ -11735,6 +12098,7 @@ exit 0"#
 
     #[test]
     fn test_patch_config_option_current_value_noop_on_non_array() {
+        crate::settings::init_for_tests();
         let mut opts = serde_json::Value::Null;
         patch_config_option_current_value(&mut opts, "effort", "high");
         assert!(opts.is_null(), "a null snapshot must stay null");
@@ -11813,6 +12177,7 @@ done"#
 
     #[tokio::test]
     async fn session_new_sends_policy_specific_base_and_scope_specific_title() {
+        crate::settings::init_for_tests();
         use crate::scope::SessionPolicy;
 
         let channel_id = Uuid::new_v4();
@@ -11921,6 +12286,7 @@ done"#
 
     #[tokio::test]
     async fn idle_channel_switch_preserves_all_sibling_sessions_and_model() {
+        crate::settings::init_for_tests();
         let channel_id = Uuid::new_v4();
         let scopes = ["a", "b"].map(|root| SessionScope::Thread {
             channel_id,
@@ -11967,6 +12333,7 @@ done"#
 
     #[tokio::test]
     async fn test_applied_switch_refreshes_capabilities_from_post_switch_snapshot() {
+        crate::settings::init_for_tests();
         // The adapter accepts the switch and echoes the target model's rebuilt
         // configOptions — including a thought_level option the default model
         // never advertised. Capabilities and the capture must reflect the target
@@ -12041,6 +12408,7 @@ done"#
 
     #[tokio::test]
     async fn test_rejected_switch_preserves_capabilities_and_emits_failure() {
+        crate::settings::init_for_tests();
         // The adapter refuses the switch with a JSON-RPC error. The session is
         // still on its default model: pre-switch capabilities survive, the
         // capture reports modelOverridden false, and a terminal `failure`
@@ -12093,6 +12461,7 @@ done"#
 
     #[tokio::test]
     async fn test_busy_path_rejection_emits_only_failure_and_consumes_pending_ack() {
+        crate::settings::init_for_tests();
         // K1 delayed-rejection at the Rust seam: a busy-path switch is armed
         // (pending_ack), its apply is deferred to this requeued session, and the
         // adapter then refuses it. The rejection arm must emit exactly one
@@ -12141,6 +12510,7 @@ done"#
 
     #[tokio::test]
     async fn test_applied_switch_without_options_drops_capabilities() {
+        crate::settings::init_for_tests();
         // A successful switch whose response carries no configOptions (older
         // adapter, or a model with no options): the pre-switch snapshot cannot
         // be trusted for the target model, so capabilities drop to None to be
@@ -12184,6 +12554,7 @@ done"#
 
     #[tokio::test]
     async fn test_unsupported_model_emits_unsupported_without_switch_rpc() {
+        crate::settings::init_for_tests();
         // The desired model is absent from the session/new catalog: no switch
         // RPC is sent, the capture reports no override, and an
         // `unsupported_model` control_result rejects the live pick.
@@ -12249,6 +12620,7 @@ done"#
     /// (`live_switch_models_from_post_switch_snapshot_parses_target_current`).
     #[tokio::test]
     async fn test_applied_switch_caches_target_model_not_pre_switch() {
+        crate::settings::init_for_tests();
         // session/new: model-a is current. switch reply: model-b is current,
         // and it echoes rebuilt configOptions so capabilities refresh cleanly.
         let session_new = r#"{"sessionId":"sess-1","configOptions":[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}],"models":{"currentModelId":"model-a","availableModels":[{"modelId":"model-a"},{"modelId":"model-b"}]}}"#;
@@ -12286,6 +12658,7 @@ done"#
     /// panel would report the pre-switch model as live after a successful switch.
     #[tokio::test]
     async fn test_applied_switch_without_models_does_not_leak_pre_switch_model() {
+        crate::settings::init_for_tests();
         // session/new advertises model-a as current; the successful switch reply
         // echoes configOptions (so the switch is Applied) but NO models block.
         let session_new = r#"{"sessionId":"sess-1","configOptions":[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}],"models":{"currentModelId":"model-a","availableModels":[{"modelId":"model-a"},{"modelId":"model-b"}]}}"#;
@@ -12359,6 +12732,7 @@ done"#
     /// effort would find no option and silently no-op.
     #[tokio::test]
     async fn test_startup_effort_resolves_against_post_switch_target_options() {
+        crate::settings::init_for_tests();
         // session/new: model-a, model option only — NO thought_level.
         let session_new = r#"[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}]"#;
         // switch reply: model-b current AND a target-only thought_level option.
@@ -12400,6 +12774,7 @@ done"#
     /// model-a options with a falsely patched `high`.
     #[tokio::test]
     async fn test_startup_effort_skips_stale_options_on_optionless_switch() {
+        crate::settings::init_for_tests();
         // session/new: model-a WITH a thought_level option.
         let session_new = r#"[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]},{"configId":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low"},{"value":"high"}]}]"#;
         // switch reply: applied, but NO echoed options.

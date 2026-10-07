@@ -12,7 +12,7 @@ fn owned_pi(acp: AcpClient, protocol_version: u32) -> OwnedAgent {
         desired_model_request_id: None,
         desired_model_pending_ack: false,
         startup_effort: None,
-        agent_name: BUZZ_PI_ACP_NAME.into(),
+        agent_name: crate::settings::get().acp.buzz_pi_acp_name.clone(),
         goose_system_prompt_supported: None,
         protocol_version,
     }
@@ -25,7 +25,7 @@ fn fixture_dir() -> std::path::PathBuf {
 }
 
 fn script_at(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
-    let path = dir.join(BUZZ_PI_ACP_NAME);
+    let path = dir.join(crate::settings::get().acp.buzz_pi_acp_name.as_str());
     std::fs::write(&path, format!("#!/bin/bash\n{script}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
@@ -33,6 +33,7 @@ fn script_at(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
+    crate::settings::init_for_tests();
     for version in [1, 2] {
         let dir = fixture_dir();
         let init = serde_json::json!({"jsonrpc":"2.0", "id":0, "result": {
@@ -134,9 +135,11 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
 
 #[tokio::test]
 async fn pi_launch_preserves_existing_skills_in_explicit_workspace() {
+    crate::settings::init_for_tests();
     const FIXTURE_ENV: &str = "BUZZ_TEST_PI_LAUNCH_WORKSPACE";
     if let Some(dir) = std::env::var_os(FIXTURE_ENV) {
-        let path = std::path::PathBuf::from(dir).join(BUZZ_PI_ACP_NAME);
+        let path = std::path::PathBuf::from(dir)
+            .join(crate::settings::get().acp.buzz_pi_acp_name.as_str());
         let mut client = AcpClient::spawn(
             path.to_str().unwrap(),
             &["--".into(), "--skill".into(), "/extra skills".into()],
@@ -203,6 +206,7 @@ pwd -P > "$(dirname "$0")/cwd""#,
 
 #[tokio::test]
 async fn upstream_pi_acp_launch_does_not_receive_managed_skills() {
+    crate::settings::init_for_tests();
     let dir = fixture_dir();
     let path = dir.join("pi-acp");
     std::fs::write(
@@ -233,6 +237,7 @@ read -r request
 #[tokio::test]
 #[ignore = "requires BUZZ_TEST_PI_ACP pointing to a built fork and Pi on PATH"]
 async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
+    crate::settings::init_for_tests();
     use base64::Engine;
     let adapter = std::env::var("BUZZ_TEST_PI_ACP").expect("set BUZZ_TEST_PI_ACP");
     let dir = fixture_dir();

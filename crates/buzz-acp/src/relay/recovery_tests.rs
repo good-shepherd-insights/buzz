@@ -37,6 +37,7 @@ async fn dispatch(
 
 #[tokio::test]
 async fn repeated_overflow_recovers_only_affected_channel_after_capacity() {
+    crate::settings::init_for_tests();
     let (mut client, mut server) = test_ws_pair().await;
     let mut state = BgState::new();
     let channels: Vec<_> = (0..18).map(|_| Uuid::new_v4()).collect();
@@ -96,6 +97,7 @@ async fn repeated_overflow_recovers_only_affected_channel_after_capacity() {
 
 #[tokio::test]
 async fn socket_owner_services_ping_shutdown_and_coalesces_overflow_ticks() {
+    crate::settings::init_for_tests();
     let (client, mut server) = test_ws_pair().await;
     let (tx, mut rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
@@ -232,6 +234,7 @@ async fn socket_owner_services_ping_shutdown_and_coalesces_overflow_ticks() {
 
 #[tokio::test]
 async fn recovery_is_fair_and_paced_even_with_new_loss_and_stale_eose() {
+    crate::settings::init_for_tests();
     let (mut client, mut server) = test_ws_pair().await;
     let mut state = BgState::new();
     let channels = [Uuid::new_v4(), Uuid::new_v4()];
@@ -272,7 +275,7 @@ async fn recovery_is_fair_and_paced_even_with_new_loss_and_stale_eose() {
         assert!(timeout(Duration::from_millis(1), server.next())
             .await
             .is_err());
-        advance_clock(recovery::RECOVERY_INTERVAL).await;
+        advance_clock(crate::settings::get().relay.recovery_interval_secs).await;
     }
     for ch in channels {
         state.active_subscriptions.remove(&ch);
@@ -287,6 +290,7 @@ async fn recovery_is_fair_and_paced_even_with_new_loss_and_stale_eose() {
 
 #[tokio::test]
 async fn gate_headroom_failed_writes_and_reconnect_preserve_pending_attempts() {
+    crate::settings::init_for_tests();
     let (mut client, mut server) = test_ws_pair().await;
     let mut state = BgState::new();
     let ch = Uuid::new_v4();
@@ -313,7 +317,7 @@ async fn gate_headroom_failed_writes_and_reconnect_preserve_pending_attempts() {
         recovery::recover_one(&mut client, &mut state, &tx, "agent").await;
     }
     assert_eq!(state.recovery.last_attempt, attempted);
-    advance_clock(recovery::RECOVERY_INTERVAL).await;
+    advance_clock(crate::settings::get().relay.recovery_interval_secs).await;
     recovery::recover_one(&mut client, &mut state, &tx, "agent").await;
     assert_ne!(
         state.recovery.last_attempt, attempted,
@@ -342,6 +346,7 @@ async fn advance_clock(duration: Duration) {
 
 #[tokio::test]
 async fn blocked_recovery_write_is_bounded_and_retains_loss() {
+    crate::settings::init_for_tests();
     let (mut client, _stalled_server) = test_ws_pair().await;
     let mut state = BgState::new();
     let ch = Uuid::new_v4();
@@ -358,7 +363,7 @@ async fn blocked_recovery_write_is_bounded_and_retains_loss() {
     )
     .await
     .unwrap();
-    assert!(started.elapsed() >= Duration::from_secs(WS_SEND_TIMEOUT_SECS));
+    assert!(started.elapsed() >= crate::settings::get().relay.ws_send_timeout_secs);
     assert_eq!(state.channel_dropped_since[&ch], 700);
     let attempted = state.recovery.last_attempt.clone();
     recovery::recover_one(&mut client, &mut state, &tx, "agent").await;
